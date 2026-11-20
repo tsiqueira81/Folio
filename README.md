@@ -13,13 +13,13 @@ documents. Free and open source, with no Folio account required.
 
 | Platform | Download | Updates |
 | --- | --- | --- |
-| **Windows** 10/11 (64-bit) | [Folio-Setup.exe](https://github.com/Forward-Future/folio-releases/releases/latest/download/Folio-Setup.exe) | Automatic |
-| **macOS** 12 or later (Apple Silicon and Intel) | [Folio-mac.dmg](https://github.com/Forward-Future/folio-releases/releases/latest/download/Folio-mac.dmg) | Folio tells you when a new version is out |
-| **Linux**: Ubuntu, Debian, and derivatives (64-bit) | [Folio-linux-amd64.deb](https://github.com/Forward-Future/folio-releases/releases/latest/download/Folio-linux-amd64.deb) | Automatic, with your system updates (apt) |
-| **Linux**: other distributions (64-bit) | [Folio-linux-x86_64.AppImage](https://github.com/Forward-Future/folio-releases/releases/latest/download/Folio-linux-x86_64.AppImage) | Automatic |
+| **Windows** 10/11 (64-bit) | [Folio-Setup.exe](https://github.com/tsiqueira81/Folio/releases/latest/download/Folio-Setup.exe) | Release page |
+| **Windows** Portable (64-bit) | [Folio-Portable.exe](https://github.com/tsiqueira81/Folio/releases/latest/download/Folio-Portable.exe) | Portable (no install) |
+| **macOS** 12 or later (Apple Silicon and Intel) | [Folio-mac.dmg](https://github.com/tsiqueira81/Folio/releases/latest/download/Folio-mac.dmg) | Release page |
+| **Linux**: Ubuntu, Debian, and derivatives (64-bit) | [Folio-linux-amd64.deb](https://github.com/tsiqueira81/Folio/releases/latest/download/Folio-linux-amd64.deb) | Release page |
+| **Linux**: other distributions (64-bit) | [Folio-linux-x86_64.AppImage](https://github.com/tsiqueira81/Folio/releases/latest/download/Folio-linux-x86_64.AppImage) | Release page |
 
-[All releases](https://github.com/Forward-Future/folio-releases/releases) · [Changelog](CHANGELOG.md) · Prefer not to
-install on Windows? **Folio-Portable.exe** on the release page runs as-is (it doesn't auto-update).
+[All releases](https://github.com/tsiqueira81/Folio/releases) · [Changelog](CHANGELOG.md)
 
 Folio's builds aren't signed with paid developer certificates yet, so the first launch needs one extra step:
 

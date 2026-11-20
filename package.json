@@ -1,9 +1,10 @@
 {
   "name": "folio-pdf-reader",
   "private": true,
-  "version": "1.10.7",
+  "version": "1.11.0",
   "productName": "Folio",
   "description": "A simple, clean PDF reader for Windows, macOS, and Linux",
+  "homepage": "https://github.com/tsiqueira81/Folio",
   "license": "MIT",
   "author": "Forward Future",
   "main": "electron/main.cjs",
@@ -116,7 +117,8 @@
         }
       ],
       "category": "Office",
-      "icon": "build/icon.png"
+      "icon": "build/icon.png",
+      "maintainer": "tsiqueira81 <tsiqueira81@users.noreply.github.com>"
     },
     "deb": {
       "artifactName": "Folio-linux-amd64.deb"
