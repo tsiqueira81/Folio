@@ -17,7 +17,7 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "app": "npm run build && electron .",
-    "dist:win": "npm run build && electron-builder --win nsis portable",
+    "dist:win": "npm run build && electron-builder --win nsis portable --publish never",
     "dist:mac": "npm run build && electron-builder --mac --publish never",
     "dist:linux": "npm run build && electron-builder --linux --publish never",
     "clean": "rm -rf dist server.js",
@@ -86,6 +86,43 @@
     },
     "portable": {
       "artifactName": "Folio-Portable.exe"
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "universal"
+          ]
+        }
+      ],
+      "category": "public.app-category.productivity",
+      "icon": "build/icon.png",
+      "artifactName": "Folio-mac.dmg"
+    },
+    "linux": {
+      "target": [
+        {
+          "target": "deb",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "category": "Office",
+      "icon": "build/icon.png"
+    },
+    "deb": {
+      "artifactName": "Folio-linux-amd64.deb"
+    },
+    "appImage": {
+      "artifactName": "Folio-linux-x86_64.AppImage"
     },
     "fileAssociations": [
       {
