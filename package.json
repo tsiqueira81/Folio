@@ -12,7 +12,8 @@
     "assets": "node scripts/copy-pdfjs-assets.mjs",
     "predev": "npm run assets",
     "prebuild": "npm run assets",
-    "dev": "vite --port=3000 --host=0.0.0.0",
+    "dev": "tsx server.ts",
+    "start": "node server.ts",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "app": "npm run build && electron .",
@@ -23,8 +24,13 @@
     "lint": "tsc --noEmit"
   },
   "dependencies": {
+    "@google/genai": "^3.6.1",
+    "@types/express": "^5.0.6",
+    "dotenv": "^18.0.10",
     "electron-updater": "^6.8.11",
-    "mammoth": "^1.13.0"
+    "express": "^5.3.0",
+    "mammoth": "^1.13.0",
+    "tsx": "^4.23.15"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",

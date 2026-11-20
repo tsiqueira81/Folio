@@ -2,7 +2,17 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react"
 import { Icon } from "./icons";
 import type { PDFDocumentProxy } from "./pdf";
 import { getAiHistory, saveAiHistory } from "./recent";
-import { CLAUDE_CODE_URL, signInChatGPT, USAGE_URL, type AiProvider } from "./ai";
+import {
+  askGeminiWeb,
+  CLAUDE_CODE_URL,
+  GEMINI_CLI_MODELS,
+  GEMINI_CLI_URL,
+  GEMINI_MODELS,
+  geminiWebStatus,
+  signInChatGPT,
+  USAGE_URL,
+  type AiProvider,
+} from "./ai";
 
 const AiMarkdown = lazy(() => import("./AiMarkdown").then((module) => ({ default: module.AiMarkdown })));
 
@@ -69,6 +79,25 @@ function instructions(name: string, doc: { text: string; truncated: boolean }) {
   ].join("\n");
 }
 
+function initialProvider(hasDesktopAi: boolean): AiProvider {
+  const saved = localStorage.getItem("folio:ai-provider");
+  if (saved === "chatgpt" || saved === "claude" || saved === "gemini") {
+    if (!hasDesktopAi && saved !== "gemini") return "gemini";
+    return saved;
+  }
+  return hasDesktopAi ? "chatgpt" : "gemini";
+}
+
+function initialModel(provider: AiProvider, desktopGeminiMode?: "api" | "cli" | "none"): string {
+  const saved = localStorage.getItem(`folio:ai-model:${provider}`);
+  if (provider === "gemini") {
+    const list = desktopGeminiMode === "cli" ? GEMINI_CLI_MODELS : GEMINI_MODELS;
+    if (saved !== null && list.some((m) => m.id === saved)) return saved;
+    return list[0]?.id ?? "";
+  }
+  return saved ?? "";
+}
+
 // ── Panel ─────────────────────────────────────────────────────────────────────────────────
 const conversations = new Map<string, Message[]>();
 
@@ -87,15 +116,17 @@ interface Props {
 export function AiPanel({ pdf, docId, persist, docName, context, onClearContext, onGoToPage, onClose }: Props) {
   const ai = window.folioDesktop?.ai;
   const [status, setStatus] = useState<AiStatus | null>(null);
-  const [provider, setProviderState] = useState<AiProvider>(() => (localStorage.getItem("folio:ai-provider") as AiProvider) || "chatgpt");
+  const [webGemini, setWebGemini] = useState<{ available: boolean; models: { id: string; name: string }[] } | null>(null);
+  const [provider, setProviderState] = useState<AiProvider>(() => initialProvider(!!ai));
   const [models, setModels] = useState<{ id: string; name: string }[]>([]);
-  const [model, setModelState] = useState(() => localStorage.getItem(`folio:ai-model:${provider}`) ?? "");
+  const [model, setModelState] = useState(() => initialModel(initialProvider(!!ai)));
   const [messages, setMessages] = useState<Message[]>(() => conversations.get(docId) ?? []);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [signingIn, setSigningIn] = useState(false);
   const [setupError, setSetupError] = useState<string | null>(null);
   const busyRef = useRef<string | null>(null);
+  const webAbortRef = useRef<AbortController | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -119,19 +150,42 @@ export function AiPanel({ pdf, docId, persist, docName, context, onClearContext,
       void saveAiHistory(docId, messages.filter((m) => !m.error && m.content).map(({ role, content, context }) => ({ role, content, ...(context ? { context } : {}) })));
     }
   }, [docId, messages, busy, loaded, persist]);
-  useEffect(() => { void ai?.status().then(setStatus); }, [ai]);
+
+  useEffect(() => {
+    if (ai) {
+      void ai.status().then(setStatus);
+    } else {
+      void geminiWebStatus().then(setWebGemini);
+    }
+  }, [ai]);
+
+  useEffect(() => () => {
+    webAbortRef.current?.abort();
+  }, []);
+
   useEffect(() => { if (context) inputRef.current?.focus(); }, [context]);
+
+  const geminiMode = ai ? status?.gemini.mode : "api";
 
   const setProvider = (next: AiProvider) => {
     setProviderState(next);
     localStorage.setItem("folio:ai-provider", next);
-    setModelState(localStorage.getItem(`folio:ai-model:${next}`) ?? "");
+    setModelState(initialModel(next, geminiMode));
     setSetupError(null);
   };
   const setModel = (id: string) => {
     setModelState(id);
     localStorage.setItem(`folio:ai-model:${provider}`, id);
   };
+
+  // Keep Gemini model selection valid when status resolves (CLI vs API mode).
+  useEffect(() => {
+    if (provider !== "gemini") return;
+    const list = ai
+      ? (status?.gemini.mode === "cli" ? GEMINI_CLI_MODELS : GEMINI_MODELS)
+      : (webGemini?.models ?? GEMINI_MODELS);
+    setModelState((current) => (list.some((m) => m.id === current) ? current : list[0]?.id ?? ""));
+  }, [ai, provider, status?.gemini.mode, webGemini]);
 
   // ChatGPT's model list depends on the signed-in account.
   const chatgptConnected = !!status?.chatgpt.connected;
@@ -149,36 +203,44 @@ export function AiPanel({ pdf, docId, persist, docName, context, onClearContext,
     });
   }, [ai, provider, chatgptConnected]);
 
-  // Stream answers into the last assistant message.
+  const applyEvent = useCallback((event: AiEvent) => {
+    if (event.id !== busyRef.current) return;
+    setMessages((list) => {
+      const next = list.slice();
+      const last = next[next.length - 1];
+      if (!last || last.role !== "assistant") return list;
+      if (event.type === "delta") next[next.length - 1] = { ...last, content: last.content + (event.text ?? "") };
+      if (event.type === "error") next[next.length - 1] = { ...last, error: { message: event.message ?? "Something went wrong.", code: event.code, link: event.link } };
+      return next;
+    });
+    if (event.type !== "delta") {
+      busyRef.current = null;
+      webAbortRef.current = null;
+      setBusy(null);
+      if (event.code === "signed_out" && ai) void ai.status().then(setStatus);
+    }
+  }, [ai]);
+
+  // Stream desktop answers into the last assistant message.
   useEffect(() => {
     if (!ai) return;
-    return ai.onEvent((event) => {
-      if (event.id !== busyRef.current) return;
-      setMessages((list) => {
-        const next = list.slice();
-        const last = next[next.length - 1];
-        if (!last || last.role !== "assistant") return list;
-        if (event.type === "delta") next[next.length - 1] = { ...last, content: last.content + (event.text ?? "") };
-        if (event.type === "error") next[next.length - 1] = { ...last, error: { message: event.message ?? "Something went wrong.", code: event.code, link: event.link } };
-        return next;
-      });
-      if (event.type !== "delta") {
-        busyRef.current = null;
-        setBusy(null);
-        if (event.code === "signed_out") void ai.status().then(setStatus);
-      }
-    });
-  }, [ai]);
+    return ai.onEvent(applyEvent);
+  }, [ai, applyEvent]);
 
   useEffect(() => {
     const el = listRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages]);
 
-  const ready = provider === "chatgpt" ? chatgptConnected : !!status?.claude.installed && status.claude.loggedIn;
+  const geminiReady = ai ? !!status?.gemini.available : !!webGemini?.available;
+  const ready = provider === "chatgpt"
+    ? (!!ai && chatgptConnected)
+    : provider === "claude"
+      ? (!!ai && !!status?.claude.installed && status.claude.loggedIn)
+      : geminiReady;
 
   const send = useCallback(async (question: string) => {
-    if (!ai || !question.trim() || busyRef.current || !ready) return;
+    if (!question.trim() || busyRef.current || !ready) return;
     const doc = await documentText(pdf);
     const userContent = context
       ? `About this passage from page ${context.page}:\n"""\n${context.text}\n"""\n\n${question.trim()}`
@@ -190,10 +252,24 @@ export function AiPanel({ pdf, docId, persist, docName, context, onClearContext,
     setMessages([...messages, { role: "user", content: question.trim(), context: context ?? undefined }, { role: "assistant", content: "" }]);
     setInput("");
     onClearContext();
+    const payloadMessages = history.map(({ role, content }) => ({ role, content }));
+    const sysInstructions = instructions(docName, doc);
+
     try {
-      await ai.ask({ id, provider, model, instructions: instructions(docName, doc), messages: history.map(({ role, content }) => ({ role, content })) });
+      if (ai) {
+        await ai.ask({ id, provider, model, instructions: sysInstructions, messages: payloadMessages });
+      } else if (provider === "gemini") {
+        const controller = new AbortController();
+        webAbortRef.current = controller;
+        await askGeminiWeb(
+          { model, instructions: sysInstructions, messages: payloadMessages },
+          (ev) => applyEvent({ id, ...ev }),
+          controller.signal,
+        );
+      }
     } catch {
       busyRef.current = null;
+      webAbortRef.current = null;
       setBusy(null);
       setMessages((list) => {
         const next = list.slice();
@@ -201,7 +277,13 @@ export function AiPanel({ pdf, docId, persist, docName, context, onClearContext,
         return next;
       });
     }
-  }, [ai, pdf, context, messages, provider, model, docName, onClearContext, ready]);
+  }, [ai, applyEvent, pdf, context, messages, provider, model, docName, onClearContext, ready]);
+
+  const cancel = () => {
+    if (!busy) return;
+    if (ai) void ai.cancel(busy);
+    else webAbortRef.current?.abort();
+  };
 
   const signIn = async () => {
     if (!ai) return;
@@ -213,6 +295,14 @@ export function AiPanel({ pdf, docId, persist, docName, context, onClearContext,
     setStatus(result.status);
   };
 
+  const modelOptions = provider === "chatgpt"
+    ? models
+    : provider === "claude"
+      ? CLAUDE_MODELS
+      : ai
+        ? (status?.gemini.mode === "cli" ? GEMINI_CLI_MODELS : GEMINI_MODELS)
+        : (webGemini?.models ?? GEMINI_MODELS);
+
   const placeholder = !ready ? "Connect an AI provider to ask questions"
     : context ? "Ask about the selected passage…" : "Ask about this document…";
 
@@ -223,6 +313,7 @@ export function AiPanel({ pdf, docId, persist, docName, context, onClearContext,
         <div className="segmented small" role="tablist" aria-label="AI provider">
           <button role="tab" aria-selected={provider === "chatgpt"} className={provider === "chatgpt" ? "on" : ""} onClick={() => setProvider("chatgpt")}>ChatGPT</button>
           <button role="tab" aria-selected={provider === "claude"} className={provider === "claude" ? "on" : ""} onClick={() => setProvider("claude")}>Claude</button>
+          <button role="tab" aria-selected={provider === "gemini"} className={provider === "gemini" ? "on" : ""} onClick={() => setProvider("gemini")}>Gemini</button>
         </div>
         <div className="ai-head-actions">
           <button className="pill-btn" title="New conversation" aria-label="New conversation" disabled={!messages.length || !!busy} onClick={() => setMessages([])}>
@@ -235,11 +326,25 @@ export function AiPanel({ pdf, docId, persist, docName, context, onClearContext,
       </header>
 
       <div className="ai-body" ref={listRef}>
-        {!ai ? (
-          <div className="ai-card"><p>Ask AI is available in the Folio desktop app.</p></div>
-        ) : !status ? (
+        {!ai && provider !== "gemini" ? (
+          <div className="ai-card">
+            <h3>{provider === "chatgpt" ? "ChatGPT" : "Claude"} in Folio</h3>
+            <p>{provider === "chatgpt" ? "ChatGPT" : "Claude"} is available in the Folio desktop app. You can ask Gemini about this document right here in your browser.</p>
+            <div className="ai-card-actions">
+              <button className="btn primary" onClick={() => setProvider("gemini")}>Switch to Gemini</button>
+            </div>
+          </div>
+        ) : (!ai && !webGemini) || (ai && !status) ? (
           <p className="ai-checking">Checking connections…</p>
-        ) : provider === "chatgpt" && !chatgptConnected ? (
+        ) : !ai && provider === "gemini" && !webGemini?.available ? (
+          <div className="ai-card">
+            <h3>Gemini isn't connected</h3>
+            <p>Check that your Gemini API key is configured in <strong>Settings &gt; Secrets</strong>, then refresh.</p>
+            <div className="ai-card-actions">
+              <button className="btn primary" onClick={() => void geminiWebStatus().then(setWebGemini)}>Check again</button>
+            </div>
+          </div>
+        ) : ai && provider === "chatgpt" && !chatgptConnected ? (
           <div className="ai-card">
             <h3>Use your ChatGPT plan</h3>
             <p>Sign in with ChatGPT to ask questions using your existing ChatGPT plan (Go, Plus, or Pro). No API key needed.</p>
@@ -249,25 +354,39 @@ export function AiPanel({ pdf, docId, persist, docName, context, onClearContext,
             {signingIn && <p className="fine">Finish signing in in your browser, then come back here.</p>}
             <p className="fine">When you ask, Folio sends your question and the document's text to OpenAI. Nothing is sent otherwise.</p>
           </div>
-        ) : provider === "claude" && !(status.claude.installed && status.claude.loggedIn) ? (
+        ) : ai && provider === "claude" && !(status!.claude.installed && status!.claude.loggedIn) ? (
           <div className="ai-card">
             <h3>Use your Claude subscription</h3>
-            {!status.claude.installed ? (
+            {!status!.claude.installed ? (
               <p>Folio uses Claude Code, Anthropic's official app, signed in with your own Claude Pro or Max account. Install Claude Code, sign in once, then check again.</p>
             ) : (
               <p>Claude Code is installed but not signed in. Open a terminal, run <code>claude</code>, and sign in with your Claude account.</p>
             )}
             <div className="ai-card-actions">
-              {!status.claude.installed && <a className="btn ghost" href={CLAUDE_CODE_URL} target="_blank" rel="noreferrer">Get Claude Code</a>}
-              <button className="btn primary" onClick={async () => setStatus({ ...status, claude: await ai.recheckClaude() })}>Check again</button>
+              {!status!.claude.installed && <a className="btn ghost" href={CLAUDE_CODE_URL} target="_blank" rel="noreferrer">Get Claude Code</a>}
+              <button className="btn primary" onClick={async () => setStatus({ ...status!, claude: await ai.recheckClaude() })}>Check again</button>
             </div>
             <p className="fine">Folio never sees your Claude password or tokens. When you ask, it sends your question and the document's text to Anthropic through Claude Code.</p>
           </div>
+        ) : ai && provider === "gemini" && !status!.gemini.available ? (
+          <div className="ai-card">
+            <h3>Use your Google account with Gemini</h3>
+            {!status!.gemini.installed ? (
+              <p>Folio connects to Gemini through Gemini CLI, Google's official CLI, signed in with your Google account. Install Gemini CLI, sign in once, then check again.</p>
+            ) : (
+              <p>Gemini CLI is installed but not signed in. Open a terminal, run <code>gemini</code>, and sign in with your Google account.</p>
+            )}
+            <div className="ai-card-actions">
+              {!status!.gemini.installed && <a className="btn ghost" href={GEMINI_CLI_URL} target="_blank" rel="noreferrer">Get Gemini CLI</a>}
+              <button className="btn primary" onClick={async () => setStatus({ ...status!, gemini: await ai.recheckGemini() })}>Check again</button>
+            </div>
+            <p className="fine">Folio never sees your Google password or tokens. When you ask, it sends your question and the document's text to Google through Gemini CLI.</p>
+          </div>
         ) : (
           <>
-            {provider === "chatgpt" && !status.chatgpt.welcomeSeen && (
+            {ai && provider === "chatgpt" && !status!.chatgpt.welcomeSeen && (
               <div className="ai-card ai-welcome">
-                <p><strong>You're connected{status.chatgpt.email ? ` as ${status.chatgpt.email}` : ""}.</strong> Questions you ask in Folio use your ChatGPT plan. You can manage usage in ChatGPT settings.</p>
+                <p><strong>You're connected{status!.chatgpt.email ? ` as ${status!.chatgpt.email}` : ""}.</strong> Questions you ask in Folio use your ChatGPT plan. You can manage usage in ChatGPT settings.</p>
                 <div className="ai-card-actions">
                   <a className="btn ghost" href={USAGE_URL} target="_blank" rel="noreferrer">Manage usage</a>
                   <button className="btn primary" onClick={async () => { await ai.chatgptWelcomeSeen(); setStatus(await ai.status()); }}>Got it</button>
@@ -347,7 +466,7 @@ export function AiPanel({ pdf, docId, persist, docName, context, onClearContext,
             }}
           />
           {busy ? (
-            <button type="button" className="send-btn" onClick={() => void ai?.cancel(busy)} title="Stop" aria-label="Stop">
+            <button type="button" className="send-btn" onClick={cancel} title="Stop" aria-label="Stop">
               <Icon name="stop" size={15} />
             </button>
           ) : (
@@ -359,12 +478,14 @@ export function AiPanel({ pdf, docId, persist, docName, context, onClearContext,
         {ready && (
           <div className="ai-meta">
             <select value={model} onChange={(e) => setModel(e.target.value)} aria-label="Model">
-              {(provider === "chatgpt" ? models : CLAUDE_MODELS).map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+              {modelOptions.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
             </select>
             {provider === "chatgpt" ? (
               <span>Using ChatGPT plan · <a href={USAGE_URL} target="_blank" rel="noreferrer">Manage usage</a></span>
-            ) : (
+            ) : provider === "claude" ? (
               <span>{status?.claude.subscription ? "Using your Claude subscription via Claude Code" : "Using Claude Code"}</span>
+            ) : (
+              <span>{ai && status?.gemini.mode === "cli" ? "Using Gemini CLI" : "Using Gemini"}</span>
             )}
           </div>
         )}

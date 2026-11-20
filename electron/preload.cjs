@@ -51,6 +51,7 @@ contextBridge.exposeInMainWorld("folioDesktop", {
     chatgptWelcomeSeen: () => ipcRenderer.invoke("folio:ai-chatgpt-welcome-seen"),
     chatgptModels: () => ipcRenderer.invoke("folio:ai-chatgpt-models"),
     recheckClaude: () => ipcRenderer.invoke("folio:ai-claude-recheck"),
+    recheckGemini: () => ipcRenderer.invoke("folio:ai-gemini-recheck"),
     ask: (request) => ipcRenderer.invoke("folio:ai-ask", request),
     cancel: (id) => ipcRenderer.invoke("folio:ai-cancel", id),
     /** Called with { id, type: "delta" | "done" | "error", text?, message?, code?, link? } for every answer. */

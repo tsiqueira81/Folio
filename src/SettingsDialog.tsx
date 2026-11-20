@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { Modal } from "./Dialogs";
-import { CLAUDE_CODE_URL, signInChatGPT, USAGE_URL, type AiProvider } from "./ai";
+import { CLAUDE_CODE_URL, GEMINI_CLI_URL, signInChatGPT, USAGE_URL, type AiProvider } from "./ai";
 import { updateSummary } from "./updates";
 
 /** One place for every Folio preference. */
@@ -114,7 +114,7 @@ export function SettingsDialog({ theme, onTheme, night, onNight, onOpenChangelog
             <Row label="Default provider" hint="Which assistant Ask AI opens with.">
               <Choice label="Default provider" value={provider as AiProvider}
                 onChange={(p) => { setProvider(p); localStorage.setItem("folio:ai-provider", p); }}
-                options={[{ id: "chatgpt", name: "ChatGPT" }, { id: "claude", name: "Claude" }]} />
+                options={[{ id: "chatgpt", name: "ChatGPT" }, { id: "claude", name: "Claude" }, { id: "gemini", name: "Gemini" }]} />
             </Row>
             <Row
               label="ChatGPT"
@@ -144,6 +144,18 @@ export function SettingsDialog({ theme, onTheme, night, onNight, onOpenChangelog
                   : "Claude Code is installed but not signed in. Run claude in a terminal and sign in."}
             >
               <button className="btn ghost" disabled={!aiStatus} onClick={async () => setAiStatus({ ...aiStatus!, claude: await ai!.recheckClaude() })}>Check again</button>
+            </Row>
+            <Row
+              label="Gemini"
+              hint={!aiStatus ? "Checking…" : aiStatus.gemini.mode === "api"
+                ? "Connected via Gemini."
+                : !aiStatus.gemini.installed
+                  ? <>Uses your Google account through <a href={GEMINI_CLI_URL} target="_blank" rel="noreferrer">Gemini CLI</a>. Install it and sign in once.</>
+                  : aiStatus.gemini.loggedIn
+                    ? `Gemini CLI ${aiStatus.gemini.version ?? ""} is signed in.`
+                    : "Gemini CLI is installed but not signed in. Run gemini in a terminal and sign in."}
+            >
+              <button className="btn ghost" disabled={!aiStatus} onClick={async () => setAiStatus({ ...aiStatus!, gemini: await ai!.recheckGemini() })}>Check again</button>
             </Row>
           </Section>
         )}

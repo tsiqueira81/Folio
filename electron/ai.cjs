@@ -459,12 +459,212 @@ function transcript(messages) {
   return `${earlier}\n\nContinue the conversation. Reply to this latest message:\n\n${messages[messages.length - 1].content}`;
 }
 
+// ── Gemini (GEMINI_API_KEY env var via @google/genai, or local Gemini CLI) ────────────────
+const GEMINI_API_MODELS = new Set(["gemini-4-hydrogen", "gemini-3.1-flash-lite"]);
+const GEMINI_DEFAULT_MODEL = "gemini-4-hydrogen";
+const GEMINI_TIMEOUT_MS = 5 * 60_000;
+
+let geminiPath;
+async function findGemini() {
+  if (geminiPath !== undefined) return geminiPath;
+  const names = process.platform === "win32" ? ["gemini.exe", "gemini.cmd"] : ["gemini"];
+  const extraDirs = process.platform === "win32"
+    ? [process.env.APPDATA ? path.join(process.env.APPDATA, "npm") : "", path.join(os.homedir(), ".local", "bin")]
+    : [path.join(os.homedir(), ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin"];
+  const dirs = [...extraDirs, ...String(process.env.PATH ?? "").split(path.delimiter)]
+    .map((d) => d.trim().replace(/^"|"$/g, ""))
+    .filter((d) => d && path.isAbsolute(d));
+  for (const d of dirs) {
+    for (const name of names) {
+      const candidate = path.join(d, name);
+      try {
+        if (fs.statSync(candidate).isFile()) {
+          geminiPath = candidate;
+          return geminiPath;
+        }
+      } catch {}
+    }
+  }
+  geminiPath = null;
+  return geminiPath;
+}
+
+function geminiCliHasCredentials() {
+  const geminiDir = path.join(os.homedir(), ".gemini");
+  const credFiles = ["oauth_creds.json", "google_accounts.json"];
+  for (const name of credFiles) {
+    try {
+      const text = fs.readFileSync(path.join(geminiDir, name), "utf8").trim();
+      if (text && text !== "{}" && text !== "null") return true;
+    } catch {}
+  }
+  try {
+    const settings = JSON.parse(fs.readFileSync(path.join(geminiDir, "settings.json"), "utf8"));
+    if (settings?.security?.auth?.selectedType || settings?.selectedAuthType) return true;
+  } catch {}
+  return Boolean(process.env.GOOGLE_CLOUD_PROJECT || process.env.GOOGLE_API_KEY);
+}
+
+function runGemini(cmd, args, timeout = 10_000) {
+  return new Promise((resolve) => {
+    const isCmd = process.platform === "win32" && /\.cmd$/i.test(cmd);
+    execFile(cmd, args, { timeout, windowsHide: true, shell: isCmd, env: claudeEnv() }, (error, stdout) =>
+      resolve(error ? null : String(stdout)),
+    );
+  });
+}
+
+let geminiStatusCache = null;
+async function geminiStatus(fresh = false) {
+  if (!fresh && geminiStatusCache && Date.now() - geminiStatusCache.at < 30_000) return geminiStatusCache.value;
+  if (process.env.GEMINI_API_KEY?.trim()) {
+    const value = { available: true, mode: "api", installed: true, loggedIn: true, version: "" };
+    geminiStatusCache = { at: Date.now(), value };
+    return value;
+  }
+  const exe = await findGemini();
+  let value = { available: false, mode: "none", installed: false, loggedIn: false, version: "" };
+  if (exe) {
+    const version = (await runGemini(exe, ["--version"]))?.trim().split(/\s/)[0] ?? "";
+    const loggedIn = geminiCliHasCredentials();
+    value = { available: loggedIn, mode: "cli", installed: true, loggedIn, version };
+  }
+  geminiStatusCache = { at: Date.now(), value };
+  return value;
+}
+
+function cleanStaleGeminiFolders() {
+  try {
+    for (const entry of fs.readdirSync(os.tmpdir())) {
+      if (entry.startsWith("folio-gemini-")) fs.rmSync(path.join(os.tmpdir(), entry), { recursive: true, force: true });
+    }
+  } catch {}
+}
+
+async function askGeminiApi({ model, instructions, messages }, emit, signal) {
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
+  if (!apiKey) throw new Error("Gemini API key is not configured.");
+  const { GoogleGenAI } = await import("@google/genai");
+  const ai = new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      headers: {
+        "User-Agent": "aistudio-build",
+      },
+    },
+  });
+  const chosenModel = model && GEMINI_API_MODELS.has(model) ? model : GEMINI_DEFAULT_MODEL;
+  const contents = messages.map((m) => ({
+    role: m.role === "assistant" ? "model" : "user",
+    parts: [{ text: m.content }],
+  }));
+  const stream = await ai.models.generateContentStream({
+    model: chosenModel,
+    contents,
+    config: instructions ? { systemInstruction: instructions } : undefined,
+  });
+  for await (const chunk of stream) {
+    if (signal.aborted) return;
+    if (chunk.text) emit(chunk.text);
+  }
+}
+
+async function askGeminiCli({ model, instructions, messages }, emit, signal) {
+  const exe = await findGemini();
+  if (!exe) throw new Error("Gemini CLI isn't installed.");
+  if (signal.aborted) return;
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "folio-gemini-"));
+  const cleanup = () => { try { fs.rmSync(cwd, { recursive: true, force: true }); } catch {} };
+  const promptFile = path.join(cwd, "system.md");
+  try {
+    fs.writeFileSync(promptFile, instructions, { mode: 0o600 });
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
+  const args = ["--output-format", "stream-json"];
+  if (model && GEMINI_API_MODELS.has(model)) args.push("-m", model);
+  const env = { ...claudeEnv(), GEMINI_SYSTEM_MD: promptFile };
+  const isCmd = process.platform === "win32" && /\.cmd$/i.test(exe);
+
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn(exe, args, { cwd, env, windowsHide: true, shell: isCmd, stdio: ["pipe", "pipe", "pipe"] });
+    } catch (error) {
+      cleanup();
+      return reject(error);
+    }
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; child.kill(); }, GEMINI_TIMEOUT_MS);
+    const abort = () => child.kill();
+    signal.addEventListener("abort", abort, { once: true });
+    let buffer = "";
+    let streamed = false;
+    let errorMsg = "";
+    let stderr = "";
+    let finalResponse = "";
+
+    child.stdout.on("data", (chunk) => {
+      buffer += chunk;
+      let nl;
+      while ((nl = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, nl).trim();
+        buffer = buffer.slice(nl + 1);
+        if (!line) continue;
+        let event;
+        try { event = JSON.parse(line); } catch { continue; }
+        if (event.type === "message" && event.role === "assistant" && typeof event.content === "string") {
+          if (event.delta) {
+            streamed = true;
+            emit(event.content);
+          } else {
+            finalResponse = event.content;
+          }
+        } else if (event.type === "error") {
+          errorMsg = String(event.message || event.error?.message || "Gemini CLI couldn't answer.");
+        } else if (event.type === "result" && event.status === "error") {
+          errorMsg = String(event.error?.message || event.message || "Gemini CLI couldn't answer.");
+        }
+      }
+    });
+    child.stderr.on("data", (chunk) => { stderr = (stderr + chunk).slice(-2000); });
+    child.stdin.on("error", () => {});
+    child.on("error", (error) => { clearTimeout(timer); cleanup(); reject(error); });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
+      cleanup();
+      if (signal.aborted) return resolve();
+      if (timedOut) return reject(new Error("Gemini took too long to answer. Please try again."));
+      if (code === 0 && !errorMsg) {
+        if (!streamed && finalResponse) emit(finalResponse);
+        return resolve();
+      }
+      const message = String(errorMsg || stderr || "");
+      if (/log ?in|sign ?in|authenticat|credentials|oauth/i.test(message)) {
+        return reject(new Error("Gemini CLI isn't signed in. Open a terminal, run `gemini`, and sign in with your Google account."));
+      }
+      if (/quota|rate limit|429|resource_exhausted/i.test(message)) {
+        return reject(Object.assign(new Error("You've reached a Gemini usage limit. Please try again in a moment."), { code: "usage_limit" }));
+      }
+      reject(new Error(message.split("\n")[0] || "Gemini CLI couldn't answer."));
+    });
+    child.stdin.end(transcript(messages));
+  });
+}
+
+async function askGemini(req, emit, signal) {
+  if (process.env.GEMINI_API_KEY?.trim()) return askGeminiApi(req, emit, signal);
+  return askGeminiCli(req, emit, signal);
+}
+
 // ── IPC surface ────────────────────────────────────────────────────────────────────────────
 const active = new Map();
 const MAX_CHARS = 1_500_000;
 
 function validRequest(req) {
-  return req && typeof req.id === "string" && req.id.length < 100 && (req.provider === "chatgpt" || req.provider === "claude")
+  return req && typeof req.id === "string" && req.id.length < 100 && (req.provider === "chatgpt" || req.provider === "claude" || req.provider === "gemini")
     && typeof req.instructions === "string" && typeof req.model === "string" && req.model.length < 100
     && Array.isArray(req.messages) && req.messages.length > 0 && req.messages.length < 200
     && req.messages.every((m) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
@@ -475,7 +675,12 @@ const MAX_ACTIVE = 2;
 
 function register(handle, send) {
   cleanStaleClaudeFolders();
-  handle("folio:ai-status", async () => ({ chatgpt: await chatgptStatus(), claude: await claudeStatus() }));
+  cleanStaleGeminiFolders();
+  handle("folio:ai-status", async () => ({
+    chatgpt: await chatgptStatus(),
+    claude: await claudeStatus(),
+    gemini: await geminiStatus(),
+  }));
   handle("folio:ai-chatgpt-signin", async () => {
     try { return { ok: true, status: await signInChatGPT() }; } catch (e) { return { ok: false, error: e.message }; }
   });
@@ -484,12 +689,19 @@ function register(handle, send) {
   handle("folio:ai-chatgpt-models", async () => {
     try { return { ok: true, models: await chatgptModels() }; } catch (e) { return { ok: false, error: e.message, code: e.code }; }
   });
-  let lastRecheck = 0;
+  let lastClaudeRecheck = 0;
   handle("folio:ai-claude-recheck", async () => {
-    if (Date.now() - lastRecheck < 2000) return claudeStatus();
-    lastRecheck = Date.now();
+    if (Date.now() - lastClaudeRecheck < 2000) return claudeStatus();
+    lastClaudeRecheck = Date.now();
     claudePath = undefined;
     return claudeStatus(true);
+  });
+  let lastGeminiRecheck = 0;
+  handle("folio:ai-gemini-recheck", async () => {
+    if (Date.now() - lastGeminiRecheck < 2000) return geminiStatus();
+    lastGeminiRecheck = Date.now();
+    geminiPath = undefined;
+    return geminiStatus(true);
   });
   handle("folio:ai-ask", (_event, req) => {
     if (!validRequest(req) || active.has(req.id)) throw new Error("Invalid request");
@@ -497,7 +709,7 @@ function register(handle, send) {
     const controller = new AbortController();
     active.set(req.id, controller);
     const emit = (text) => send("folio:ai-event", { id: req.id, type: "delta", text });
-    const ask = req.provider === "chatgpt" ? askChatGPT : askClaude;
+    const ask = req.provider === "chatgpt" ? askChatGPT : req.provider === "gemini" ? askGemini : askClaude;
     Promise.resolve(ask(req, emit, controller.signal))
       .then(() => send("folio:ai-event", { id: req.id, type: "done" }))
       .catch((e) => send("folio:ai-event", controller.signal.aborted ? { id: req.id, type: "done" }

@@ -36,6 +36,7 @@ interface FolioDesktop {
 interface AiStatus {
   chatgpt: { connected: boolean; email: string; name: string; welcomeSeen: boolean; encrypted: boolean };
   claude: { installed: boolean; loggedIn: boolean; version?: string; subscription?: boolean; authMethod?: string };
+  gemini: { available: boolean; mode: "api" | "cli" | "none"; installed: boolean; loggedIn: boolean; version?: string };
 }
 
 interface AiMessage {
@@ -59,7 +60,8 @@ interface FolioAi {
   chatgptWelcomeSeen(): Promise<boolean>;
   chatgptModels(): Promise<{ ok: boolean; models?: { id: string; name: string }[]; error?: string; code?: string }>;
   recheckClaude(): Promise<AiStatus["claude"]>;
-  ask(request: { id: string; provider: "chatgpt" | "claude"; model: string; instructions: string; messages: AiMessage[] }): Promise<boolean>;
+  recheckGemini(): Promise<AiStatus["gemini"]>;
+  ask(request: { id: string; provider: "chatgpt" | "claude" | "gemini"; model: string; instructions: string; messages: AiMessage[] }): Promise<boolean>;
   cancel(id: string): Promise<boolean>;
   onEvent(callback: (event: AiEvent) => void): () => void;
 }
