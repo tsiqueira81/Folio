@@ -459,40 +459,66 @@ function transcript(messages) {
   return `${earlier}\n\nContinue the conversation. Reply to this latest message:\n\n${messages[messages.length - 1].content}`;
 }
 
-// ── Gemini (GEMINI_API_KEY env var via @google/genai, or local Gemini CLI) ────────────────
+// ── Gemini (GEMINI_API_KEY env var via @google/genai, Antigravity CLI `agy`, or legacy `gemini`) ──
 const GEMINI_API_MODELS = new Set(["gemini-4-hydrogen", "gemini-3.1-flash-lite"]);
 const GEMINI_DEFAULT_MODEL = "gemini-4-hydrogen";
 const GEMINI_TIMEOUT_MS = 5 * 60_000;
 
-let geminiPath;
-async function findGemini() {
-  if (geminiPath !== undefined) return geminiPath;
-  const names = process.platform === "win32" ? ["gemini.exe", "gemini.cmd"] : ["gemini"];
-  const extraDirs = process.platform === "win32"
-    ? [process.env.APPDATA ? path.join(process.env.APPDATA, "npm") : "", path.join(os.homedir(), ".local", "bin")]
-    : [path.join(os.homedir(), ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin"];
-  const dirs = [...extraDirs, ...String(process.env.PATH ?? "").split(path.delimiter)]
+let geminiCliInfo; // { exe: string, kind: "agy" | "gemini" } | null | undefined
+async function findGeminiCli() {
+  if (geminiCliInfo !== undefined) return geminiCliInfo;
+  const win = process.platform === "win32";
+  const pathDirs = String(process.env.PATH ?? "")
+    .split(path.delimiter)
     .map((d) => d.trim().replace(/^"|"$/g, ""))
     .filter((d) => d && path.isAbsolute(d));
-  for (const d of dirs) {
-    for (const name of names) {
+
+  const agyDirs = win
+    ? [
+        process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, "agy", "bin") : "",
+        path.join(os.homedir(), ".agy", "bin"),
+        path.join(os.homedir(), ".local", "bin"),
+        ...pathDirs,
+      ]
+    : [path.join(os.homedir(), ".local", "bin"), path.join(os.homedir(), ".agy", "bin"), "/opt/homebrew/bin", "/usr/local/bin", ...pathDirs];
+
+  const agyNames = win ? ["agy.exe", "agy.cmd"] : ["agy"];
+  for (const d of agyDirs.filter((x) => x && path.isAbsolute(x))) {
+    for (const name of agyNames) {
       const candidate = path.join(d, name);
       try {
         if (fs.statSync(candidate).isFile()) {
-          geminiPath = candidate;
-          return geminiPath;
+          geminiCliInfo = { exe: candidate, kind: "agy" };
+          return geminiCliInfo;
         }
       } catch {}
     }
   }
-  geminiPath = null;
-  return geminiPath;
+
+  // Fallback for enterprise/API users still running legacy Gemini CLI.
+  const legacyDirs = win
+    ? [process.env.APPDATA ? path.join(process.env.APPDATA, "npm") : "", path.join(os.homedir(), ".local", "bin"), ...pathDirs]
+    : [path.join(os.homedir(), ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin", ...pathDirs];
+  const legacyNames = win ? ["gemini.exe", "gemini.cmd"] : ["gemini"];
+  for (const d of legacyDirs.filter((x) => x && path.isAbsolute(x))) {
+    for (const name of legacyNames) {
+      const candidate = path.join(d, name);
+      try {
+        if (fs.statSync(candidate).isFile()) {
+          geminiCliInfo = { exe: candidate, kind: "gemini" };
+          return geminiCliInfo;
+        }
+      } catch {}
+    }
+  }
+
+  geminiCliInfo = null;
+  return geminiCliInfo;
 }
 
-function geminiCliHasCredentials() {
+function legacyGeminiHasCredentials() {
   const geminiDir = path.join(os.homedir(), ".gemini");
-  const credFiles = ["oauth_creds.json", "google_accounts.json"];
-  for (const name of credFiles) {
+  for (const name of ["oauth_creds.json", "google_accounts.json"]) {
     try {
       const text = fs.readFileSync(path.join(geminiDir, name), "utf8").trim();
       if (text && text !== "{}" && text !== "null") return true;
@@ -505,7 +531,7 @@ function geminiCliHasCredentials() {
   return Boolean(process.env.GOOGLE_CLOUD_PROJECT || process.env.GOOGLE_API_KEY);
 }
 
-function runGemini(cmd, args, timeout = 10_000) {
+function runGeminiCmd(cmd, args, timeout = 10_000) {
   return new Promise((resolve) => {
     const isCmd = process.platform === "win32" && /\.cmd$/i.test(cmd);
     execFile(cmd, args, { timeout, windowsHide: true, shell: isCmd, env: claudeEnv() }, (error, stdout) =>
@@ -522,12 +548,15 @@ async function geminiStatus(fresh = false) {
     geminiStatusCache = { at: Date.now(), value };
     return value;
   }
-  const exe = await findGemini();
+  const found = await findGeminiCli();
   let value = { available: false, mode: "none", installed: false, loggedIn: false, version: "" };
-  if (exe) {
-    const version = (await runGemini(exe, ["--version"]))?.trim().split(/\s/)[0] ?? "";
-    const loggedIn = geminiCliHasCredentials();
-    value = { available: loggedIn, mode: "cli", installed: true, loggedIn, version };
+  if (found) {
+    const rawVer = (await runGeminiCmd(found.exe, ["--version"]))?.trim() ?? "";
+    const version = rawVer.split(/\s+/).pop() ?? "";
+    // Antigravity CLI (`agy`) stores its Google session in the OS keyring rather than a plain JSON file,
+    // so treat an installed `agy` binary as ready and surface an auth hint if a request asks for sign-in.
+    const loggedIn = found.kind === "agy" ? true : legacyGeminiHasCredentials();
+    value = { available: loggedIn, mode: "cli", cli: found.kind, installed: true, loggedIn, version };
   }
   geminiStatusCache = { at: Date.now(), value };
   return value;
@@ -570,27 +599,24 @@ async function askGeminiApi({ model, instructions, messages }, emit, signal) {
 }
 
 async function askGeminiCli({ model, instructions, messages }, emit, signal) {
-  const exe = await findGemini();
-  if (!exe) throw new Error("Gemini CLI isn't installed.");
+  const found = await findGeminiCli();
+  if (!found) throw new Error("Antigravity CLI isn't installed.");
   if (signal.aborted) return;
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "folio-gemini-"));
   const cleanup = () => { try { fs.rmSync(cwd, { recursive: true, force: true }); } catch {} };
-  const promptFile = path.join(cwd, "system.md");
-  try {
-    fs.writeFileSync(promptFile, instructions, { mode: 0o600 });
-  } catch (error) {
-    cleanup();
-    throw error;
-  }
-  const args = ["--output-format", "stream-json"];
-  if (model && GEMINI_API_MODELS.has(model)) args.push("-m", model);
-  const env = { ...claudeEnv(), GEMINI_SYSTEM_MD: promptFile };
-  const isCmd = process.platform === "win32" && /\.cmd$/i.test(exe);
+  const isCmd = process.platform === "win32" && /\.cmd$/i.test(found.exe);
+
+  // Use explicit headless -p prompt and send the full reading instructions + conversation on stdin
+  // so `agy` never enters interactive REPL mode and never hits Windows command-line length limits.
+  const args = ["-p", "Follow the system_instructions and answer the user's question from stdin. Reply only with the answer.", "--output-format", "stream-json"];
+  if (model && found.kind === "gemini" && GEMINI_API_MODELS.has(model)) args.push("--model", model);
+
+  const stdinPayload = `<system_instructions>\n${instructions}\n</system_instructions>\n\n${transcript(messages)}`;
 
   return new Promise((resolve, reject) => {
     let child;
     try {
-      child = spawn(exe, args, { cwd, env, windowsHide: true, shell: isCmd, stdio: ["pipe", "pipe", "pipe"] });
+      child = spawn(found.exe, args, { cwd, env: claudeEnv(), windowsHide: true, shell: isCmd, stdio: ["pipe", "pipe", "pipe"] });
     } catch (error) {
       cleanup();
       return reject(error);
@@ -605,6 +631,12 @@ async function askGeminiCli({ model, instructions, messages }, emit, signal) {
     let stderr = "";
     let finalResponse = "";
 
+    const extractText = (value) => {
+      if (typeof value === "string") return value;
+      if (Array.isArray(value)) return value.map((p) => (typeof p === "string" ? p : typeof p?.text === "string" ? p.text : "")).join("");
+      return "";
+    };
+
     child.stdout.on("data", (chunk) => {
       buffer += chunk;
       let nl;
@@ -613,18 +645,33 @@ async function askGeminiCli({ model, instructions, messages }, emit, signal) {
         buffer = buffer.slice(nl + 1);
         if (!line) continue;
         let event;
-        try { event = JSON.parse(line); } catch { continue; }
-        if (event.type === "message" && event.role === "assistant" && typeof event.content === "string") {
-          if (event.delta) {
-            streamed = true;
-            emit(event.content);
-          } else {
-            finalResponse = event.content;
+        try { event = JSON.parse(line); } catch {
+          // If the CLI emitted plain text instead of NDJSON, stream it directly.
+          streamed = true;
+          emit(line + "\n");
+          continue;
+        }
+        if (event.type === "message" && event.role === "assistant") {
+          const text = extractText(event.content);
+          if (text) {
+            if (event.delta) { streamed = true; emit(text); }
+            else finalResponse = text;
           }
+        } else if (event.type === "stream_event" && typeof event.event?.delta?.text === "string") {
+          streamed = true;
+          emit(event.event.delta.text);
+        } else if (event.type === "text" && typeof event.text === "string") {
+          streamed = true;
+          emit(event.text);
         } else if (event.type === "error") {
-          errorMsg = String(event.message || event.error?.message || "Gemini CLI couldn't answer.");
-        } else if (event.type === "result" && event.status === "error") {
-          errorMsg = String(event.error?.message || event.message || "Gemini CLI couldn't answer.");
+          errorMsg = String(event.message || event.error?.message || "Gemini couldn't answer.");
+        } else if (event.type === "result") {
+          if (event.status === "error" || event.is_error) {
+            errorMsg = String(event.error?.message || event.message || event.result || "Gemini couldn't answer.");
+          } else {
+            const text = extractText(event.response ?? event.result ?? event.text);
+            if (text) finalResponse = text;
+          }
         }
       }
     });
@@ -641,16 +688,18 @@ async function askGeminiCli({ model, instructions, messages }, emit, signal) {
         if (!streamed && finalResponse) emit(finalResponse);
         return resolve();
       }
+      const cliLabel = found.kind === "agy" ? "Antigravity CLI" : "Gemini CLI";
+      const cliCmd = found.kind === "agy" ? "agy" : "gemini";
       const message = String(errorMsg || stderr || "");
-      if (/log ?in|sign ?in|authenticat|credentials|oauth/i.test(message)) {
-        return reject(new Error("Gemini CLI isn't signed in. Open a terminal, run `gemini`, and sign in with your Google account."));
+      if (/log ?in|sign ?in|authenticat|credentials|oauth|unauthenticated/i.test(message)) {
+        return reject(new Error(`${cliLabel} isn't signed in. Open a terminal, run \`${cliCmd}\`, and sign in with your Google account.`));
       }
       if (/quota|rate limit|429|resource_exhausted/i.test(message)) {
         return reject(Object.assign(new Error("You've reached a Gemini usage limit. Please try again in a moment."), { code: "usage_limit" }));
       }
-      reject(new Error(message.split("\n")[0] || "Gemini CLI couldn't answer."));
+      reject(new Error(message.split("\n")[0] || `${cliLabel} couldn't answer.`));
     });
-    child.stdin.end(transcript(messages));
+    child.stdin.end(stdinPayload);
   });
 }
 
@@ -700,7 +749,7 @@ function register(handle, send) {
   handle("folio:ai-gemini-recheck", async () => {
     if (Date.now() - lastGeminiRecheck < 2000) return geminiStatus();
     lastGeminiRecheck = Date.now();
-    geminiPath = undefined;
+    geminiCliInfo = undefined;
     return geminiStatus(true);
   });
   handle("folio:ai-ask", (_event, req) => {

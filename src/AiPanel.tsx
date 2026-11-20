@@ -372,15 +372,26 @@ export function AiPanel({ pdf, docId, persist, docName, context, onClearContext,
           <div className="ai-card">
             <h3>Use your Google account with Gemini</h3>
             {!status!.gemini.installed ? (
-              <p>Folio connects to Gemini through Gemini CLI, Google's official CLI, signed in with your Google account. Install Gemini CLI, sign in once, then check again.</p>
+              <>
+                <p>Folio connects to Gemini through <strong>Antigravity CLI</strong> (<code>agy</code>), Google's official CLI signed in with your Google account.</p>
+                <p>
+                  {window.folioDesktop?.platform === "win32" ? (
+                    <>Run in PowerShell: <code>irm https://antigravity.google/cli/install.ps1 | iex</code>, then run <code>agy</code> once to sign in and click Check again.</>
+                  ) : (
+                    <>Install Antigravity CLI, run <code>agy</code> once to sign in, then click Check again.</>
+                  )}
+                </p>
+              </>
             ) : (
-              <p>Gemini CLI is installed but not signed in. Open a terminal, run <code>gemini</code>, and sign in with your Google account.</p>
+              <p>
+                {status!.gemini.cli === "agy" ? "Antigravity CLI" : "Gemini CLI"} is installed but not signed in. Open a terminal, run <code>{status!.gemini.cli === "agy" ? "agy" : "gemini"}</code>, and sign in with your Google account.
+              </p>
             )}
             <div className="ai-card-actions">
-              {!status!.gemini.installed && <a className="btn ghost" href={GEMINI_CLI_URL} target="_blank" rel="noreferrer">Get Gemini CLI</a>}
+              {!status!.gemini.installed && <a className="btn ghost" href={GEMINI_CLI_URL} target="_blank" rel="noreferrer">Get Antigravity</a>}
               <button className="btn primary" onClick={async () => setStatus({ ...status!, gemini: await ai.recheckGemini() })}>Check again</button>
             </div>
-            <p className="fine">Folio never sees your Google password or tokens. When you ask, it sends your question and the document's text to Google through Gemini CLI.</p>
+            <p className="fine">Folio never sees your Google password or tokens. When you ask, it sends your question and the document's text to Google through Antigravity CLI.</p>
           </div>
         ) : (
           <>
@@ -485,7 +496,7 @@ export function AiPanel({ pdf, docId, persist, docName, context, onClearContext,
             ) : provider === "claude" ? (
               <span>{status?.claude.subscription ? "Using your Claude subscription via Claude Code" : "Using Claude Code"}</span>
             ) : (
-              <span>{ai && status?.gemini.mode === "cli" ? "Using Gemini CLI" : "Using Gemini"}</span>
+              <span>{ai && status?.gemini.mode === "cli" ? (status.gemini.cli === "agy" ? "Using Gemini via Antigravity CLI" : "Using Gemini CLI") : "Using Gemini"}</span>
             )}
           </div>
         )}

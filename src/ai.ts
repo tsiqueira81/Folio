@@ -3,7 +3,7 @@ export type AiProvider = "chatgpt" | "claude" | "gemini";
 
 export const USAGE_URL = "https://chatgpt.com/settings/usage";
 export const CLAUDE_CODE_URL = "https://claude.com/claude-code";
-export const GEMINI_CLI_URL = "https://geminicli.com";
+export const GEMINI_CLI_URL = "https://antigravity.google";
 
 export const GEMINI_MODELS = [
   { id: "gemini-4-hydrogen", name: "Gemini 4 Flash" },
@@ -12,7 +12,6 @@ export const GEMINI_MODELS = [
 
 export const GEMINI_CLI_MODELS = [
   { id: "", name: "Default model" },
-  ...GEMINI_MODELS,
 ];
 
 /** Runs the ChatGPT sign-in (it opens the browser); resolves once it's over with the refreshed status. */

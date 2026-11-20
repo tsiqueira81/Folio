@@ -36,7 +36,7 @@ interface FolioDesktop {
 interface AiStatus {
   chatgpt: { connected: boolean; email: string; name: string; welcomeSeen: boolean; encrypted: boolean };
   claude: { installed: boolean; loggedIn: boolean; version?: string; subscription?: boolean; authMethod?: string };
-  gemini: { available: boolean; mode: "api" | "cli" | "none"; installed: boolean; loggedIn: boolean; version?: string };
+  gemini: { available: boolean; mode: "api" | "cli" | "none"; cli?: "agy" | "gemini"; installed: boolean; loggedIn: boolean; version?: string };
 }
 
 interface AiMessage {
