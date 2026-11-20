@@ -1,0 +1,6 @@
+{
+  "name": "Folio",
+  "description": "A simple, clean PDF reader for viewing, searching, annotating, and signing PDF documents.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
