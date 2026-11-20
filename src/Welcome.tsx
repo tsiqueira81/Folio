@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { clearRecent, listRecent, removeRecent, type RecentFile } from "./recent";
+import { clearRecent, listRecent, onRecentChange, readRecentBytes, removeRecent, type RecentFile } from "./recent";
 import { Icon } from "./icons";
 import { keys } from "./platform";
 import { formatBytes } from "./Dialogs";
@@ -58,7 +58,7 @@ function UpdateLine({ status }: { status: UpdateStatus }) {
 interface Props {
   onPick: () => void;
   onOpenUrl: () => void;
-  onOpenBytes: (name: string, data: Uint8Array) => void;
+  onOpenBytes: (name: string, data: Uint8Array, password?: string, opts?: { background?: boolean; filePath?: string }) => void;
   onError: (message: string) => void;
   onSample: () => void;
   loading: boolean;
@@ -76,13 +76,26 @@ export function Welcome({ onPick, onOpenUrl, onOpenBytes, onError, onSample, loa
   }, []);
 
   useEffect(() => {
-    listRecent().then(setRecent);
+    let active = true;
+    const refresh = () => {
+      void listRecent().then((list) => {
+        if (active) setRecent(list);
+      });
+    };
+    refresh();
+    const unsubscribe = onRecentChange(refresh);
+    return () => {
+      active = false;
+      unsubscribe();
+    };
   }, []);
 
-  // A stored blob that can't be read back is dead weight: drop the entry so it doesn't keep failing.
+  // A stored entry that can't be read back (e.g. a moved/deleted file) is dropped so it doesn't keep failing.
   const reopen = async (f: RecentFile) => {
     try {
-      onOpenBytes(f.name, new Uint8Array(await f.data.arrayBuffer()));
+      const result = await readRecentBytes(f);
+      if (!result) throw new Error("Missing recent file");
+      onOpenBytes(result.name, result.data, undefined, { filePath: result.filePath });
     } catch {
       await forget(f.id);
       onError(`Couldn't reopen “${f.name}”. It was removed from Recent.`);

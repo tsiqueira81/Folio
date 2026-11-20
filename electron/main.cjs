@@ -7,6 +7,7 @@ const { pathToFileURL } = require("node:url");
 const { isIP } = require("node:net");
 const { autoUpdater } = require("electron-updater");
 const ai = require("./ai.cjs");
+const recent = require("./recent.cjs");
 const { captureWebpage } = require("./webpage.cjs");
 const { safePdfName } = require("./filenames.cjs");
 const { csp } = require("./csp.cjs");
@@ -85,7 +86,7 @@ async function sendFile(file) {
       return;
     }
     const data = await fs.promises.readFile(file);
-    if (!target.isDestroyed()) target.webContents.send("folio:open-file", { name: path.basename(file), data });
+    if (!target.isDestroyed()) target.webContents.send("folio:open-file", { name: path.basename(file), data, filePath: file });
   } catch (err) {
     dialog.showErrorBox("Couldn't open file", `${file}\n\n${err.message}`);
   }
@@ -102,19 +103,21 @@ async function sendWordFile(file, target) {
     const output = pdfPathFor(file);
     if (output?.existing) {
       const data = await fs.promises.readFile(output.file);
-      return send("folio:open-file", { name: path.basename(output.file), data });
+      return send("folio:open-file", { name: path.basename(output.file), data, filePath: output.file });
     }
     const data = await convertToPdf(file, (msg) => logConvert(`${file}: ${msg}`));
     let name = original.replace(/\.[^.]+$/, ".pdf");
     let note = null;
+    let filePath;
     if (output) {
       try {
         await fs.promises.writeFile(output.file, data, { flag: "wx" });
         name = path.basename(output.file);
         note = `Saved ${name} next to ${original}.`;
+        filePath = output.file;
       } catch {}
     }
-    send("folio:open-file", { name, data, note });
+    send("folio:open-file", { name, data, note, filePath });
   } catch (error) {
     logConvert(`${file}: ${error?.stack || error}`);
     send("folio:open-failed", { message: `Couldn't convert “${original}” to PDF. ${error?.userMessage ?? ""}`.trim() });
@@ -489,6 +492,7 @@ if (!app.requestSingleInstanceLock()) {
     });
 
     ai.register(handle, (channel, payload) => win?.webContents.send(channel, payload));
+    recent.register(handle);
 
     handle("folio:ready", () => {
       rendererReady = true;

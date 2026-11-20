@@ -9,7 +9,7 @@ import {
 } from "./viewer";
 import { AnnotationEditorParamsType, AnnotationEditorType } from "pdfjs-dist";
 import { loadPdf, thumbnailDataUrl, type PDFDocumentProxy } from "./pdf";
-import { contentKey, fileId, getRecent, MAX_RECENT_FILE_BYTES, saveRecent, updateLastPage } from "./recent";
+import { contentKey, fileId, getRecent, MAX_RECENT_FILE_BYTES, readRecentBytes, saveRecent, updateLastPage, updateRecentThumb } from "./recent";
 import { activeDocument, FIT_SCALES, flushViews, openTabs, readView, setActiveDocument, setOpenTabs, writeView, type ReadingView } from "./session";
 import { SearchResults } from "./SearchResults";
 import { Icon, type IconName } from "./icons";
@@ -412,7 +412,7 @@ export default function App() {
   }, [markTabDirty]);
 
   const openBytes = useCallback(
-    async (name: string, data: Uint8Array, password?: string, opts?: { background?: boolean }) => {
+    async (name: string, data: Uint8Array, password?: string, opts?: { background?: boolean; filePath?: string }) => {
       const id = fileId(name, data.byteLength);
       if (!opts?.background) {
         beginLoading();
@@ -468,22 +468,33 @@ export default function App() {
         }
 
         // Password-protected documents stay out of Recent: it would keep their bytes and a page-1
-        // thumbnail unprotected on disk. Very large files are skipped too — see MAX_RECENT_FILE_BYTES.
-        if (persist && data.byteLength <= MAX_RECENT_FILE_BYTES) void (async () => {
-          const thumb = existing?.thumb ?? (await thumbnailDataUrl(pdf).catch(() => ""));
-          if (!tabsRef.current.some((t) => t.id === id)) return;
+        // thumbnail unprotected on disk. On desktop, local files with a disk path are saved regardless of size.
+        const filePath = opts?.filePath || existing?.filePath;
+        const canStoreRecent = persist && (data.byteLength <= MAX_RECENT_FILE_BYTES || Boolean(filePath && window.folioDesktop));
+        if (canStoreRecent) {
           const keepIds = new Set(tabsRef.current.map((t) => t.id));
-          await saveRecent({
-            id,
-            name,
-            size: data.byteLength,
-            pages: pdf.numPages,
-            openedAt: Date.now(),
-            lastPage: docRef.current?.id === id ? pageRef.current : next.lastPage,
-            thumb,
-            data: pdfBlob(data),
-          }, keepIds);
-        })().catch(() => {});
+          void (async () => {
+            // Save immediately so closing the tab or app right after opening never loses the Recent entry.
+            await saveRecent(
+              {
+                id,
+                name,
+                size: data.byteLength,
+                pages: pdf.numPages,
+                openedAt: Date.now(),
+                lastPage: docRef.current?.id === id ? pageRef.current : next.lastPage,
+                thumb: existing?.thumb ?? "",
+                filePath,
+              },
+              keepIds,
+              data,
+            );
+            if (!existing?.thumb && tabsRef.current.some((t) => t.id === id)) {
+              const thumb = await thumbnailDataUrl(pdf).catch(() => "");
+              if (thumb) await updateRecentThumb(id, thumb);
+            }
+          })().catch(() => {});
+        }
       } catch (err) {
         if (opts?.background) return;
         const e = err as { name?: string; code?: number; message?: string };
@@ -511,7 +522,8 @@ export default function App() {
         return;
       }
       try {
-        await openBytes(file.name, new Uint8Array(await file.arrayBuffer()));
+        const filePath = window.folioDesktop?.getPathForFile?.(file) || undefined;
+        await openBytes(file.name, new Uint8Array(await file.arrayBuffer()), undefined, { filePath });
       } catch {
         setError(`Couldn't open “${file.name}”. The file may have been moved or deleted.`);
       }
@@ -935,9 +947,9 @@ export default function App() {
   // Desktop app: PDFs (and converted Word documents) opened from the OS, and restoring previously open tabs.
   useEffect(() => {
     let cancelled = false;
-    const unsubscribe = window.folioDesktop?.onOpenFile((name, data, note) => {
+    const unsubscribe = window.folioDesktop?.onOpenFile((name, data, note, filePath) => {
       setToast(null);
-      void openBytes(name, data).then(() => { if (note && docRef.current?.name === name) flash(note); });
+      void openBytes(name, data, undefined, { filePath }).then(() => { if (note && docRef.current?.name === name) flash(note); });
     });
     const unsubscribeConverting = window.folioDesktop?.onConverting((name) => {
       beginLoading();
@@ -962,8 +974,9 @@ export default function App() {
           const recent = await getRecent(id);
           if (!recent || cancelled) return null;
           try {
-            const data = new Uint8Array(await recent.data.arrayBuffer());
-            if (cancelled) return null;
+            const loadedRecent = await readRecentBytes(recent);
+            if (!loadedRecent || cancelled) return null;
+            const data = loadedRecent.data;
             const key = await contentKey(data);
             const pdf = await loadPdf(data).promise;
             if (cancelled) {

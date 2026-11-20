@@ -4,7 +4,7 @@ const { contextBridge, ipcRenderer, webUtils } = require("electron");
 contextBridge.exposeInMainWorld("folioDesktop", {
   /** Called with (name, data, note?) whenever a PDF is opened from Explorer, or a Word document has been converted. */
   onOpenFile(callback) {
-    const listener = (_e, file) => callback(file.name, new Uint8Array(file.data), file.note ?? undefined);
+    const listener = (_e, file) => callback(file.name, new Uint8Array(file.data), file.note ?? undefined, file.filePath ?? undefined);
     ipcRenderer.on("folio:open-file", listener);
     return () => ipcRenderer.removeListener("folio:open-file", listener);
   },
@@ -21,6 +21,10 @@ contextBridge.exposeInMainWorld("folioDesktop", {
   },
   /** Converts a picked or dropped Word document; it arrives through onOpenFile. */
   openDocument: (file) => ipcRenderer.invoke("folio:open-document", webUtils.getPathForFile(file)),
+  /** Returns the local filesystem path for a user-picked or dropped File object, or "" if unavailable. */
+  getPathForFile(file) {
+    try { return webUtils.getPathForFile(file) || ""; } catch { return ""; }
+  },
   ready: () => ipcRenderer.invoke("folio:ready"),
   platform: process.platform,
   openDownload: () => ipcRenderer.invoke("folio:open-download"),
@@ -60,5 +64,18 @@ contextBridge.exposeInMainWorld("folioDesktop", {
       ipcRenderer.on("folio:ai-event", listener);
       return () => ipcRenderer.removeListener("folio:ai-event", listener);
     },
+  },
+  recent: {
+    list: () => ipcRenderer.invoke("folio:recent-list"),
+    get: (id) => ipcRenderer.invoke("folio:recent-get", id),
+    async read(id) {
+      const result = await ipcRenderer.invoke("folio:recent-read", id);
+      if (!result?.data) return null;
+      return { name: result.name, data: new Uint8Array(result.data), filePath: result.filePath ?? undefined };
+    },
+    save: (entry, bytes, keepIds) => ipcRenderer.invoke("folio:recent-save", entry, bytes ?? null, keepIds ?? []),
+    update: (id, patch) => ipcRenderer.invoke("folio:recent-update", id, patch),
+    remove: (id) => ipcRenderer.invoke("folio:recent-remove", id),
+    clear: () => ipcRenderer.invoke("folio:recent-clear"),
   },
 });

@@ -9,11 +9,13 @@ interface UpdateStatus {
 // Present only when Folio runs as the desktop app (see electron/preload.cjs).
 interface FolioDesktop {
   /** `note` says where a converted Word document's PDF was saved. */
-  onOpenFile(callback: (name: string, data: Uint8Array, note?: string) => void): () => void;
+  onOpenFile(callback: (name: string, data: Uint8Array, note?: string, filePath?: string) => void): () => void;
   onConverting(callback: (name: string) => void): () => void;
   onOpenFailed(callback: (message: string) => void): () => void;
   /** Converts a Word document (.doc, .docx) to PDF; the result arrives through onOpenFile. */
   openDocument(file: File): Promise<void>;
+  /** Returns the disk path for a user-picked or dropped File, or "". */
+  getPathForFile(file: File): string;
   ready(): Promise<boolean>;
   fetchPdf(url: string): Promise<{ name: string; data: Uint8Array }>;
   getAppInfo(): Promise<{ version: string; mode: "development" | "portable" | "installed" | "appimage" | "package"; location: string; platform: string;
@@ -31,6 +33,28 @@ interface FolioDesktop {
   getAutoUpdateEnabled(): Promise<boolean>;
   setAutoUpdateEnabled(enabled: boolean): Promise<boolean>;
   ai: FolioAi;
+  recent: FolioRecent;
+}
+
+interface DesktopRecentEntry {
+  id: string;
+  name: string;
+  size: number;
+  pages: number;
+  openedAt: number;
+  lastPage: number;
+  thumb: string;
+  filePath?: string;
+}
+
+interface FolioRecent {
+  list(): Promise<DesktopRecentEntry[]>;
+  get(id: string): Promise<DesktopRecentEntry | null>;
+  read(id: string): Promise<{ name: string; data: Uint8Array; filePath?: string } | null>;
+  save(entry: DesktopRecentEntry, bytes?: Uint8Array | null, keepIds?: string[]): Promise<boolean>;
+  update(id: string, patch: { lastPage?: number; thumb?: string }): Promise<boolean>;
+  remove(id: string): Promise<boolean>;
+  clear(): Promise<boolean>;
 }
 
 interface AiStatus {
