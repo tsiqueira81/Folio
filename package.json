@@ -93,10 +93,11 @@
         {
           "target": "dmg",
           "arch": [
-            "universal"
+            "arm64"
           ]
         }
       ],
+      "identity": null,
       "category": "public.app-category.productivity",
       "icon": "build/icon.png",
       "artifactName": "Folio-mac.dmg"
