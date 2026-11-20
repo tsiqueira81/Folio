@@ -84,11 +84,16 @@ export async function getRecent(id: string): Promise<RecentFile | undefined> {
   }
 }
 
-export async function saveRecent(file: RecentFile) {
+export async function saveRecent(file: RecentFile, keepIds?: ReadonlySet<string>) {
   try {
     await tx("readwrite", (s) => s.put(file));
     const all = await listRecent();
-    for (const old of all.slice(MAX_RECENT)) await removeRecent(old.id);
+    // Never evict documents that are currently open in a tab so session restore stays intact.
+    let closedCount = 0;
+    for (const item of all) {
+      if (keepIds?.has(item.id)) continue;
+      if (++closedCount > MAX_RECENT) await removeRecent(item.id);
+    }
   } catch {
     /* storage may be unavailable (private mode); recent files are best-effort */
   }

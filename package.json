@@ -55,6 +55,9 @@
     },
     "files": [
       "dist/**/*",
+      "!dist/*.zip",
+      "!dist/*.exe",
+      "!dist/assets/**/*",
       "electron/**/*",
       "package.json",
       "!node_modules/mammoth/mammoth.browser*.js"

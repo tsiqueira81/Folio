@@ -14,7 +14,7 @@ export const FIT_SCALES = ["auto", "page-width", "page-fit"];
 const pendingViews = new Map<string, ReadingView>();
 let saveTimer = 0;
 
-function flushViews() {
+export function flushViews() {
   window.clearTimeout(saveTimer);
   saveTimer = 0;
   for (const [id, view] of pendingViews) {
@@ -58,5 +58,22 @@ export function activeDocument(): string | null {
     return localStorage.getItem("folio:active-document");
   } catch {
     return null;
+  }
+}
+
+export function setOpenTabs(ids: string[]) {
+  try {
+    if (ids.length > 0) localStorage.setItem("folio:open-tabs", JSON.stringify(ids));
+    else localStorage.removeItem("folio:open-tabs");
+  } catch {}
+}
+
+export function openTabs(): string[] {
+  try {
+    const raw = JSON.parse(localStorage.getItem("folio:open-tabs") || "[]");
+    if (!Array.isArray(raw)) return [];
+    return raw.filter((id): id is string => typeof id === "string" && id.length > 0);
+  } catch {
+    return [];
   }
 }

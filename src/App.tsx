@@ -10,10 +10,11 @@ import {
 import { AnnotationEditorParamsType, AnnotationEditorType } from "pdfjs-dist";
 import { loadPdf, thumbnailDataUrl, type PDFDocumentProxy } from "./pdf";
 import { contentKey, fileId, getRecent, MAX_RECENT_FILE_BYTES, saveRecent, updateLastPage } from "./recent";
-import { activeDocument, FIT_SCALES, readView, setActiveDocument, writeView, type ReadingView } from "./session";
+import { activeDocument, FIT_SCALES, flushViews, openTabs, readView, setActiveDocument, setOpenTabs, writeView, type ReadingView } from "./session";
 import { SearchResults } from "./SearchResults";
 import { Icon, type IconName } from "./icons";
 import { Welcome } from "./Welcome";
+import { TabBar } from "./TabBar";
 import { Sidebar, type SidebarTab } from "./Sidebar";
 import { MarkupController, type Mark, type MarkupState } from "./markup";
 import { HighlightMenu, NoteBox, SelectionPopover, useTextSelection, type SelectionInfo } from "./Selection";
@@ -79,6 +80,12 @@ interface OpenDoc {
   /** The file's size; its bytes live in pdf.js's worker (pdf.getData()) rather than in a second copy here. */
   size: number;
   pdf: PDFDocumentProxy;
+  /** False for password-protected PDFs, which stay out of disk storage and session restore. */
+  persist: boolean;
+  /** True when this tab has unsaved annotations (e.g. a placed signature or markup on a protected PDF). */
+  dirty: boolean;
+  /** Last known page from Recent before a saved ReadingView takes over. */
+  lastPage: number;
 }
 
 interface Pending {
@@ -101,14 +108,18 @@ export default function App() {
   const restoreRef = useRef<ReadingView | null>(null);
   const restoringRef = useRef(false);
   const preferencesRef = useRef({ sidebar: true, spread: false });
-  const openGeneration = useRef(0);
+  const loadingCountRef = useRef(0);
   const lastPageRef = useRef<number>(1);
+  const tabsRef = useRef<OpenDoc[]>([]);
   const docRef = useRef<OpenDoc | null>(null);
   const markupRef = useRef<MarkupController | null>(null);
   const persistRef = useRef(false);
   const dirtyRef = useRef(false);
+  const showLibraryRef = useRef(false);
 
-  const [doc, setDoc] = useState<OpenDoc | null>(null);
+  const [tabs, setTabs] = useState<OpenDoc[]>([]);
+  const [activeTabId, setActiveTabId] = useState<string | null>(null);
+  const [showLibrary, setShowLibrary] = useState(false);
   const [loading, setLoading] = useState(false);
   const [page, setPage] = useState(1);
   const [pageInput, setPageInput] = useState("1");
@@ -136,7 +147,6 @@ export default function App() {
   colorsRef.current = colors;
   const pageRef = useRef(1);
   pageRef.current = page;
-  const [dirty, setDirty] = useState(false);
   const [focus, setFocus] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [dialog, setDialog] = useState<"info" | "wordcount" | "shortcuts" | "about" | "url" | "settings" | "changelog" | null>(null);
@@ -160,6 +170,11 @@ export default function App() {
   const [aiOpen, setAiOpen] = useState(false);
   const [aiContext, setAiContext] = useState<AiContext | null>(null);
 
+  const doc = tabs.find((t) => t.id === activeTabId) ?? null;
+  const dirty = !!doc?.dirty;
+  const anyDirty = tabs.some((t) => t.dirty);
+  const viewingDoc = !!doc && !showLibrary;
+
   useEffect(() => {
     setSigning(false); setSignatureTargets([]); setSignatureDismissed(false);
     if (!doc) return;
@@ -170,14 +185,40 @@ export default function App() {
       }).catch(() => {});
     }, 350);
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [doc, page]);
+  }, [doc?.id, page]);
 
+  tabsRef.current = tabs;
   docRef.current = doc;
   dirtyRef.current = dirty;
+  showLibraryRef.current = showLibrary;
   preferencesRef.current = { sidebar, spread };
 
-  /** Opening another document drops unsaved work (a placed signature, markup on a password-protected PDF), so ask first. */
-  const mayReplaceDocument = () => !dirtyRef.current || confirm("You have unsaved annotations. Open another document anyway?");
+  const persistOpenTabIds = useCallback((list: OpenDoc[]) => {
+    setOpenTabs(list.filter((t) => t.persist).map((t) => t.id));
+  }, []);
+
+  const markTabDirty = useCallback((id: string, isDirty: boolean) => {
+    setTabs((prev) => {
+      let changed = false;
+      const next = prev.map((t) => {
+        if (t.id !== id || t.dirty === isDirty) return t;
+        changed = true;
+        return { ...t, dirty: isDirty };
+      });
+      if (changed) tabsRef.current = next;
+      return changed ? next : prev;
+    });
+  }, []);
+
+  const beginLoading = useCallback(() => {
+    loadingCountRef.current += 1;
+    setLoading(true);
+  }, []);
+
+  const endLoading = useCallback(() => {
+    loadingCountRef.current = Math.max(0, loadingCountRef.current - 1);
+    if (loadingCountRef.current === 0) setLoading(false);
+  }, []);
 
   const toastTimer = useRef(0);
   const flash = useCallback((msg: string) => {
@@ -274,81 +315,177 @@ export default function App() {
     return () => { stopDrawingPointer(); container.removeEventListener("wheel", onWheel); };
   }, []);
 
-  // ── Opening documents ───────────────────────────────────────────────
+  // ── Tabs & opening documents ────────────────────────────────────────
+  const activateTab = useCallback((tab: OpenDoc, opts?: { keepLibrary?: boolean }) => {
+    const viewer = viewerRef.current!;
+    const keepLibrary = !!opts?.keepLibrary;
+
+    if (docRef.current?.id === tab.id) {
+      if (!keepLibrary && showLibraryRef.current) {
+        setShowLibrary(false);
+        document.title = `${tab.name} — Folio`;
+        if (tab.persist) setActiveDocument(tab.id);
+      }
+      return;
+    }
+
+    // Persist outgoing reading position before switching documents.
+    flushViews();
+
+    const saved = readView(tab.id);
+    restoreRef.current = saved;
+    lastPageRef.current = Math.min(saved?.page ?? tab.lastPage ?? 1, tab.pdf.numPages);
+    if (saved) {
+      setSidebar(saved.sidebar);
+      setSpread(saved.spread);
+      spreadRef.current = saved.spread;
+      preferencesRef.current = { sidebar: saved.sidebar, spread: saved.spread };
+    }
+
+    docRef.current = tab;
+    persistRef.current = tab.persist;
+    // Sync & flush outgoing tab's live editors before pdf.js swaps the document.
+    void markupRef.current!.load(tab.key, tab.persist);
+
+    setNoteBox(null);
+    setPinned(null);
+    setHighlightMenu(null);
+    setImageMenu(null);
+    setImageView(null);
+    setSigning(false);
+    setSignatureTargets([]);
+    setSignatureDismissed(false);
+    setAiContext(null);
+    setSearchOpen(false);
+    setFind({ current: 0, total: 0, state: null });
+    busRef.current?.dispatch("findbarclose", { source: null });
+    setTool("select");
+
+    viewer.setDocument(tab.pdf);
+    linkRef.current!.setDocument(tab.pdf, null);
+
+    setActiveTabId(tab.id);
+    if (!keepLibrary) setShowLibrary(false);
+    setNumPages(tab.pdf.numPages);
+    setPage(lastPageRef.current);
+    setPageInput(String(lastPageRef.current));
+    setRotation(saved?.rotation ?? 0);
+    document.title = keepLibrary ? "New tab — Folio" : `${tab.name} — Folio`;
+    if (tab.persist) setActiveDocument(tab.id);
+  }, []);
+
+  const selectTab = useCallback((id: string) => {
+    const tab = tabsRef.current.find((t) => t.id === id);
+    if (tab) activateTab(tab);
+  }, [activateTab]);
+
+  const toggleLibrary = useCallback(() => {
+    if (tabsRef.current.length === 0) return;
+    if (showLibraryRef.current) {
+      setShowLibrary(false);
+      if (docRef.current) document.title = `${docRef.current.name} — Folio`;
+      return;
+    }
+    flushViews();
+    markupRef.current?.sync();
+    markupRef.current?.flush();
+    if (document.fullscreenElement) void document.exitFullscreen().catch(() => {});
+    setFocus(false);
+    setNoteBox(null);
+    setPinned(null);
+    setHighlightMenu(null);
+    setImageMenu(null);
+    setSearchOpen(false);
+    busRef.current?.dispatch("findbarclose", { source: null });
+    setShowLibrary(true);
+    document.title = "New tab — Folio";
+  }, []);
+
+  const bindAnnotationDirty = useCallback((pdf: PDFDocumentProxy, id: string, persist: boolean) => {
+    // Markup is saved automatically; only documents Folio can't store count as having unsaved changes.
+    (pdf.annotationStorage as { onSetModified: unknown }).onSetModified = () => {
+      if (!persist) markTabDirty(id, true);
+    };
+    (pdf.annotationStorage as { onResetModified: unknown }).onResetModified = () => {
+      markTabDirty(id, false);
+    };
+  }, [markTabDirty]);
+
   const openBytes = useCallback(
-    async (name: string, data: Uint8Array, password?: string) => {
-      const generation = ++openGeneration.current;
-      const viewer = viewerRef.current!;
-      setLoading(true);
-      setError(null);
+    async (name: string, data: Uint8Array, password?: string, opts?: { background?: boolean }) => {
+      const id = fileId(name, data.byteLength);
+      if (!opts?.background) {
+        beginLoading();
+        setError(null);
+      }
       try {
-        const pdf = await loadPdf(data, password).promise;
-        const id = fileId(name, data.byteLength);
         const key = await contentKey(data);
-        const existing = await getRecent(id);
-        if (generation !== openGeneration.current) {
-          void pdf.loadingTask.destroy();
+        // Switch to existing tab instead of opening a duplicate copy.
+        const duplicate = tabsRef.current.find((t) => t.key === key || t.id === id);
+        if (duplicate) {
+          if (!opts?.background) {
+            setPending(null);
+            activateTab(duplicate);
+          }
           return;
         }
-        const saved = readView(id);
-        restoreRef.current = saved;
-        lastPageRef.current = Math.min(saved?.page ?? existing?.lastPage ?? 1, pdf.numPages);
-        if (saved) {
-          setSidebar(saved.sidebar);
-          setSpread(saved.spread);
-          spreadRef.current = saved.spread;
-          preferencesRef.current = { sidebar: saved.sidebar, spread: saved.spread };
+
+        const pdf = await loadPdf(data, password).promise;
+        const existing = await getRecent(id);
+
+        // Guard against a concurrent open for the same file resolving first.
+        const raced = tabsRef.current.find((t) => t.key === key || t.id === id);
+        if (raced) {
+          void pdf.loadingTask.destroy();
+          if (!opts?.background) {
+            setPending(null);
+            activateTab(raced);
+          }
+          return;
         }
 
-        const prev = docRef.current;
-        const next: OpenDoc = { id, key, name, size: data.byteLength, pdf };
-        docRef.current = next;
-        // Password-protected documents aren't stored by Folio (same rule as Recent).
-        persistRef.current = !password;
-        void markupRef.current!.load(key, !password);
-        setNoteBox(null);
-        setPinned(null);
-        setAiContext(null);
-        viewer.setDocument(pdf);
-        linkRef.current!.setDocument(pdf, null);
-        prev?.pdf.loadingTask.destroy();
+        const persist = !password;
+        bindAnnotationDirty(pdf, id, persist);
 
-        // Markup is saved automatically; only documents Folio can't store count as having unsaved changes.
-        (pdf.annotationStorage as { onSetModified: unknown }).onSetModified = () => { if (!persistRef.current) setDirty(true); };
-        (pdf.annotationStorage as { onResetModified: unknown }).onResetModified = () => setDirty(false);
+        const next: OpenDoc = {
+          id,
+          key,
+          name,
+          size: data.byteLength,
+          pdf,
+          persist,
+          dirty: false,
+          lastPage: existing?.lastPage ?? 1,
+        };
+        const nextTabs = [...tabsRef.current, next];
+        tabsRef.current = nextTabs;
+        setTabs(nextTabs);
+        persistOpenTabIds(nextTabs);
 
-        setDoc(next);
-        setNumPages(pdf.numPages);
-        setPage(lastPageRef.current);
-        setPageInput(String(lastPageRef.current));
-        setRotation(0);
-        setDirty(false);
-        setTool("select");
-        setPending(null);
-        setSearchOpen(false);
-        setFind({ current: 0, total: 0, state: null });
-        document.title = `${name} — Folio`;
+        if (!opts?.background) {
+          setPending(null);
+          activateTab(next);
+        }
 
-        setLoading(false);
-        setActiveDocument(id);
         // Password-protected documents stay out of Recent: it would keep their bytes and a page-1
         // thumbnail unprotected on disk. Very large files are skipped too — see MAX_RECENT_FILE_BYTES.
-        if (!password && data.byteLength <= MAX_RECENT_FILE_BYTES) void (async () => {
+        if (persist && data.byteLength <= MAX_RECENT_FILE_BYTES) void (async () => {
           const thumb = existing?.thumb ?? (await thumbnailDataUrl(pdf).catch(() => ""));
-          if (generation !== openGeneration.current) return;
+          if (!tabsRef.current.some((t) => t.id === id)) return;
+          const keepIds = new Set(tabsRef.current.map((t) => t.id));
           await saveRecent({
             id,
             name,
             size: data.byteLength,
             pages: pdf.numPages,
             openedAt: Date.now(),
-            lastPage: pageRef.current,
+            lastPage: docRef.current?.id === id ? pageRef.current : next.lastPage,
             thumb,
             data: pdfBlob(data),
-          });
+          }, keepIds);
         })().catch(() => {});
       } catch (err) {
-        if (generation !== openGeneration.current) return;
+        if (opts?.background) return;
         const e = err as { name?: string; code?: number; message?: string };
         if (e?.name === "PasswordException") {
           setPending({ name, data, error: e.code === 2 ? "Incorrect password. Try again." : undefined });
@@ -356,10 +493,10 @@ export default function App() {
           setError(`Couldn't open “${name}”. ${e?.message ?? "The file may be damaged."}`);
         }
       } finally {
-        if (generation === openGeneration.current) setLoading(false);
+        if (!opts?.background) endLoading();
       }
     },
-    [],
+    [activateTab, beginLoading, bindAnnotationDirty, endLoading, persistOpenTabIds],
   );
 
   const openFile = useCallback(
@@ -373,7 +510,6 @@ export default function App() {
         setError(`“${file.name}” isn't a PDF.`);
         return;
       }
-      if (!mayReplaceDocument()) return;
       try {
         await openBytes(file.name, new Uint8Array(await file.arrayBuffer()));
       } catch {
@@ -386,17 +522,21 @@ export default function App() {
   const pickFile = useCallback(() => {
     const input = document.createElement("input");
     input.type = "file";
+    input.multiple = true;
     input.accept = window.folioDesktop ? "application/pdf,.pdf,.doc,.docx" : "application/pdf,.pdf";
-    input.onchange = () => { if (input.files?.[0]) void openFile(input.files[0]); };
+    input.onchange = () => {
+      if (!input.files?.length) return;
+      void (async () => {
+        for (const file of Array.from(input.files!)) await openFile(file);
+      })();
+    };
     input.click();
   }, [openFile]);
 
   const openUrl = useCallback(
     async (url: string) => {
-      if (!mayReplaceDocument()) return;
-      const generation = ++openGeneration.current;
       const host = new URL(url).hostname;
-      setLoading(true);
+      beginLoading();
       setError(null);
       setToast(`Opening ${host}…`);
       try {
@@ -415,17 +555,16 @@ export default function App() {
           const name = decodeURIComponent(new URL(res.url || url).pathname.split("/").filter(Boolean).pop() || host);
           file = { name: /\.pdf$/i.test(name) ? name : name + ".pdf", data };
         }
-        if (generation !== openGeneration.current) return;
         setToast(null);
         await openBytes(file.name, file.data);
       } catch (e: any) {
-        if (generation !== openGeneration.current) return;
         setToast(null);
-        setLoading(false);
         setError(`Couldn't open that link. ${e?.message ?? ""}`.trim());
+      } finally {
+        endLoading();
       }
     },
-    [openBytes],
+    [beginLoading, endLoading, openBytes],
   );
 
   const openSample = useCallback(async () => {
@@ -437,36 +576,69 @@ export default function App() {
     }
   }, [openBytes]);
 
-  const closeDoc = useCallback(() => {
-    if (dirty && !confirm("You have unsaved annotations. Close anyway?")) return;
-    openGeneration.current++;
-    setActiveDocument(null);
-    markupRef.current!.unload();
-    setNoteBox(null);
-    setLoading(false);
-    setPending(null);
-    viewerRef.current!.setDocument(null as unknown as PDFDocumentProxy);
-    linkRef.current!.setDocument(null, null);
-    docRef.current?.pdf.loadingTask.destroy();
-    docRef.current = null;
-    setDoc(null);
-    setDirty(false);
-    setSearchOpen(false);
-    setFocus(false);
-    document.title = "Folio";
-  }, [dirty]);
+  const closeTab = useCallback((id: string) => {
+    const index = tabsRef.current.findIndex((t) => t.id === id);
+    if (index === -1) return;
+    const tab = tabsRef.current[index];
+    if (tab.dirty && !confirm(`“${tab.name}” has unsaved annotations. Close this tab anyway?`)) return;
+
+    const wasActive = docRef.current?.id === id;
+    if (wasActive) {
+      flushViews();
+      markupRef.current!.unload();
+    }
+
+    const nextTabs = tabsRef.current.filter((t) => t.id !== id);
+    tabsRef.current = nextTabs;
+    setTabs(nextTabs);
+    persistOpenTabIds(nextTabs);
+    markupRef.current?.forget(tab.key);
+
+    if (nextTabs.length === 0) {
+      setActiveDocument(null);
+      setNoteBox(null);
+      setPinned(null);
+      setHighlightMenu(null);
+      setImageMenu(null);
+      setImageView(null);
+      setPending(null);
+      viewerRef.current!.setDocument(null as unknown as PDFDocumentProxy);
+      linkRef.current!.setDocument(null, null);
+      docRef.current = null;
+      setActiveTabId(null);
+      setShowLibrary(false);
+      setSearchOpen(false);
+      setFocus(false);
+      document.title = "Folio";
+    } else if (wasActive) {
+      const fallback = nextTabs[Math.min(index, nextTabs.length - 1)];
+      activateTab(fallback, { keepLibrary: showLibraryRef.current });
+    }
+
+    void tab.pdf.loadingTask.destroy();
+  }, [activateTab, persistOpenTabIds]);
+
+  const stepTab = useCallback((delta: number) => {
+    const list = tabsRef.current;
+    if (list.length === 0) return;
+    const currentIndex = list.findIndex((t) => t.id === docRef.current?.id);
+    const nextIndex = currentIndex === -1
+      ? 0
+      : (currentIndex + delta + list.length) % list.length;
+    activateTab(list[nextIndex]);
+  }, [activateTab]);
 
   // Remember where the reader left off.
   useEffect(() => {
     if (!doc) return;
     const saved = readView(doc.id);
     if (saved) writeView(doc.id, { ...saved, sidebar, spread });
-  }, [doc, sidebar, spread]);
+  }, [doc?.id, sidebar, spread]);
   useEffect(() => {
     if (!doc) return;
     const timer = window.setTimeout(() => void updateLastPage(doc.id, page), 600);
     return () => window.clearTimeout(timer);
-  }, [doc, page]);
+  }, [doc?.id, page]);
 
   // ── Actions ─────────────────────────────────────────────────────────
   const goTo = useCallback((n: number) => {
@@ -517,7 +689,7 @@ export default function App() {
   };
 
   // ── Highlights and notes ────────────────────────────────────────────
-  const liveSelection = useTextSelection(container, !!doc && tool === "select" && !signing && !noteBox);
+  const liveSelection = useTextSelection(container, viewingDoc && tool === "select" && !signing && !noteBox);
   // Typing in the popover's note field clears the page selection, so the popover keeps its own copy.
   const selection = pinned ?? liveSelection;
   const highlightColor = colors.highlight ?? HIGHLIGHTS[0].hex;
@@ -645,7 +817,7 @@ export default function App() {
       if (v?.pdfDocument && FIT_SCALES.includes(v.currentScaleValue)) v.currentScaleValue = v.currentScaleValue;
     }, 280);
     return () => window.clearTimeout(timer);
-  }, [aiOpen, sidebar, sidebarTab, focus]);
+  }, [aiOpen, sidebar, sidebarTab, focus, showLibrary]);
   useEffect(() => {
     const stage = container?.parentElement;
     if (!stage) return;
@@ -724,6 +896,7 @@ export default function App() {
 
   const print = async () => {
     // pdf.js marks the document as saved once it has written the bytes, but printing saves nothing.
+    const current = docRef.current;
     const unsaved = dirtyRef.current;
     let copy: Awaited<ReturnType<typeof currentBytes>>;
     try {
@@ -732,7 +905,7 @@ export default function App() {
       setError("Couldn't print this document.");
       return;
     } finally {
-      if (unsaved) setDirty(true);
+      if (unsaved && current) markTabDirty(current.id, true);
     }
     if (!copy) return;
     const { bytes } = copy;
@@ -759,36 +932,103 @@ export default function App() {
     }, 60_000);
   };
 
-  // Desktop app: PDFs (and converted Word documents) opened from Explorer, and a title bar that matches the theme.
+  // Desktop app: PDFs (and converted Word documents) opened from the OS, and restoring previously open tabs.
   useEffect(() => {
     let cancelled = false;
-    const generation = openGeneration.current;
     const unsubscribe = window.folioDesktop?.onOpenFile((name, data, note) => {
       setToast(null);
-      if (!mayReplaceDocument()) return setLoading(false);
       void openBytes(name, data).then(() => { if (note && docRef.current?.name === name) flash(note); });
     });
     const unsubscribeConverting = window.folioDesktop?.onConverting((name) => {
-      setLoading(true);
+      beginLoading();
       setError(null);
       setToast(`Converting ${name} to PDF…`);
     });
     const unsubscribeFailed = window.folioDesktop?.onOpenFailed((message) => {
       setToast(null);
-      setLoading(false);
+      endLoading();
       setError(message);
     });
     void (async () => {
       const hasStartupFile = await window.folioDesktop?.ready();
-      if (hasStartupFile || cancelled || generation !== openGeneration.current) return;
-      const id = activeDocument();
-      const recent = id ? await getRecent(id) : undefined;
-      if (!recent || cancelled || generation !== openGeneration.current) return;
-      const data = new Uint8Array(await recent.data.arrayBuffer());
-      if (!cancelled && generation === openGeneration.current) void openBytes(recent.name, data);
-    })().catch(() => {}); // restoring the last document is best-effort
-    return () => { cancelled = true; unsubscribe?.(); unsubscribeConverting?.(); unsubscribeFailed?.(); };
-  }, [openBytes]);
+      if (cancelled) return;
+      const savedIds = openTabs();
+      const savedActiveId = activeDocument();
+      const idsToRestore = savedIds.length > 0 ? savedIds : (savedActiveId ? [savedActiveId] : []);
+      if (idsToRestore.length === 0) return;
+
+      const loaded = await Promise.all(
+        idsToRestore.map(async (id): Promise<OpenDoc | null> => {
+          const recent = await getRecent(id);
+          if (!recent || cancelled) return null;
+          try {
+            const data = new Uint8Array(await recent.data.arrayBuffer());
+            if (cancelled) return null;
+            const key = await contentKey(data);
+            const pdf = await loadPdf(data).promise;
+            if (cancelled) {
+              void pdf.loadingTask.destroy();
+              return null;
+            }
+            bindAnnotationDirty(pdf, recent.id, true);
+            return {
+              id: recent.id,
+              key,
+              name: recent.name,
+              size: recent.size,
+              pdf,
+              persist: true,
+              dirty: false,
+              lastPage: recent.lastPage,
+            };
+          } catch {
+            return null;
+          }
+        }),
+      );
+      if (cancelled) return;
+
+      const restored: OpenDoc[] = [];
+      const seenKeys = new Set(tabsRef.current.map((t) => t.key));
+      const seenIds = new Set(tabsRef.current.map((t) => t.id));
+      for (const entry of loaded) {
+        if (!entry) continue;
+        if (seenKeys.has(entry.key) || seenIds.has(entry.id)) {
+          void entry.pdf.loadingTask.destroy();
+          continue;
+        }
+        seenKeys.add(entry.key);
+        seenIds.add(entry.id);
+        restored.push(entry);
+      }
+      if (restored.length === 0) {
+        if (tabsRef.current.length === 0) setOpenTabs([]);
+        return;
+      }
+
+      // Preserve saved tab order, placing any OS startup file at the end (and keeping it active).
+      const merged = [...restored, ...tabsRef.current];
+      tabsRef.current = merged;
+      setTabs(merged);
+      persistOpenTabIds(merged);
+
+      if (!hasStartupFile && !docRef.current) {
+        const target = restored.find((t) => t.id === savedActiveId) ?? restored[restored.length - 1];
+        activateTab(target);
+      }
+    })().catch(() => {}); // restoring open tabs is best-effort
+    return () => {
+      cancelled = true;
+      unsubscribe?.();
+      unsubscribeConverting?.();
+      unsubscribeFailed?.();
+    };
+  }, [activateTab, beginLoading, bindAnnotationDirty, endLoading, flash, openBytes, persistOpenTabIds]);
+
+  useEffect(() => () => {
+    for (const tab of tabsRef.current) void tab.pdf.loadingTask.destroy();
+  }, []);
+
   useEffect(() => window.folioDesktop?.setTheme(theme), [theme]);
   // The update banner appears once a new version has been downloaded (the status reports that right away too).
   useEffect(() => window.folioDesktop?.onUpdateStatus((status) => {
@@ -825,13 +1065,13 @@ export default function App() {
     setNight(next);
   };
 
-  // Warn before losing unsaved annotations.
+  // Warn before losing unsaved annotations in any open tab.
   useEffect(() => {
-    if (!dirty) return;
+    if (!anyDirty) return;
     const onBeforeUnload = (e: BeforeUnloadEvent) => e.preventDefault();
     window.addEventListener("beforeunload", onBeforeUnload);
     return () => window.removeEventListener("beforeunload", onBeforeUnload);
-  }, [dirty]);
+  }, [anyDirty]);
 
   // ── Keyboard shortcuts ──────────────────────────────────────────────
   useEffect(() => {
@@ -850,6 +1090,45 @@ export default function App() {
         e.preventDefault();
         if (e.shiftKey) setDialog("url");
         else pickFile();
+        return;
+      }
+      if (tabsRef.current.length > 0) {
+        if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "t") {
+          e.preventDefault();
+          toggleLibrary();
+          return;
+        }
+        if (((e.altKey && !mod) || (window.folioDesktop && mod && !e.altKey)) && e.key.toLowerCase() === "w" && docRef.current && !showLibraryRef.current) {
+          e.preventDefault();
+          closeTab(docRef.current.id);
+          return;
+        }
+        if (e.ctrlKey && !e.metaKey && !e.altKey && e.key === "Tab") {
+          e.preventDefault();
+          stepTab(e.shiftKey ? -1 : 1);
+          return;
+        }
+        if (e.altKey && !mod && !typing && (e.key === "ArrowRight" || e.key === "ArrowLeft")) {
+          e.preventDefault();
+          stepTab(e.key === "ArrowRight" ? 1 : -1);
+          return;
+        }
+        if (e.altKey && !mod && !typing && /^[1-9]$/.test(e.key)) {
+          const list = tabsRef.current;
+          const idx = e.key === "9" ? list.length - 1 : Number(e.key) - 1;
+          if (list[idx]) {
+            e.preventDefault();
+            activateTab(list[idx]);
+          }
+          return;
+        }
+      }
+
+      if (showLibraryRef.current) {
+        if (e.key === "Escape" && !dialog) {
+          e.preventDefault();
+          toggleLibrary();
+        }
         return;
       }
       if (!docRef.current) return;
@@ -954,9 +1233,13 @@ export default function App() {
       e.preventDefault();
       depth = 0;
       setDragging(false);
-      const file = e.dataTransfer?.files[0];
-      const url = !file && e.dataTransfer ? droppedUrl(e.dataTransfer) : null;
-      if (file) void openFile(file);
+      const files = e.dataTransfer?.files ? Array.from(e.dataTransfer.files) : [];
+      const url = files.length === 0 && e.dataTransfer ? droppedUrl(e.dataTransfer) : null;
+      if (files.length > 0) {
+        void (async () => {
+          for (const file of files) await openFile(file);
+        })();
+      }
       else if (url) void openUrl(url);
       else setError("Drop a PDF file or a link to a PDF.");
     };
@@ -1010,29 +1293,28 @@ export default function App() {
     <div
       className="app"
       data-focus={focus || undefined}
-      data-sidebar={(sidebar && !!doc && !focus) || undefined}
+      data-tabs={tabs.length > 0 || undefined}
+      data-sidebar={(sidebar && viewingDoc && !focus) || undefined}
       data-night={night || undefined}
       data-tool={tool}
     >
       <header className="topbar">
         <div className="topbar-left">
-          <button className="brand" onClick={doc ? closeDoc : undefined} title={doc ? "Back to library" : "Folio"}>
+          <button
+            className="brand"
+            onClick={tabs.length > 0 ? toggleLibrary : undefined}
+            title={tabs.length > 0 ? (showLibrary ? "Back to document" : "Library / New tab") : "Folio"}
+          >
             <span className="brand-mark" />
             <span className="brand-name">Folio</span>
           </button>
-          {doc && (
-            <>
-              <IconButton icon="sidebar" label={keys("Toggle sidebar (Ctrl+\\)")} active={sidebar} onClick={() => setSidebar(!sidebar)} />
-              <div className="doc-title" title={doc.name}>
-                <span>{doc.name.replace(/\.pdf$/i, "")}</span>
-                {dirty && <span className="dirty-dot" title="Unsaved annotations" />}
-              </div>
-            </>
+          {viewingDoc && (
+            <IconButton icon="sidebar" label={keys("Toggle sidebar (Ctrl+\\)")} active={sidebar} onClick={() => setSidebar(!sidebar)} />
           )}
         </div>
 
         <div className="topbar-center">
-          {doc && (
+          {viewingDoc && (
             <div className="segmented" role="toolbar" aria-label="Tools">
               {TOOLS.map((t) => (
                 <button
@@ -1051,7 +1333,7 @@ export default function App() {
         </div>
 
         <div className="topbar-right">
-          {doc && (
+          {viewingDoc && (
             <>
               <IconButton icon="sparkle" label="Ask AI" active={aiOpen} onClick={() => setAiOpen(!aiOpen)} />
               <IconButton icon="search" label={keys("Search (Ctrl+F)")} active={searchOpen} onClick={() => (searchOpen ? closeSearch() : setSearchOpen(true))} />
@@ -1059,7 +1341,7 @@ export default function App() {
           )}
           <MoreMenu
             items={[
-              ...(doc
+              ...(viewingDoc
                 ? ([
                     { kind: "action", icon: "download", label: "Save a copy", shortcut: keys("Ctrl S"), onSelect: download },
                     { kind: "action", icon: "print", label: "Print", shortcut: keys("Ctrl P"), onSelect: print },
@@ -1092,9 +1374,21 @@ export default function App() {
         </div>
       </header>
 
+      {tabs.length > 0 && (
+        <TabBar
+          tabs={tabs}
+          activeId={activeTabId}
+          showLibrary={showLibrary}
+          onSelect={selectTab}
+          onClose={closeTab}
+          onNewTab={toggleLibrary}
+        />
+      )}
+
       <div className="body">
         {doc && (
           <Sidebar
+            key={doc.id}
             pdf={doc.pdf}
             page={page}
             rotation={rotation}
@@ -1269,15 +1563,25 @@ export default function App() {
         )}
       </div>
 
-      {!doc && <Welcome onPick={pickFile} onOpenUrl={() => setDialog("url")} onOpenBytes={openBytes} onError={setError} onSample={openSample} loading={loading} />}
+      {(!doc || showLibrary) && (
+        <Welcome
+          key={showLibrary ? "library" : "empty"}
+          onPick={pickFile}
+          onOpenUrl={() => setDialog("url")}
+          onOpenBytes={openBytes}
+          onError={setError}
+          onSample={openSample}
+          loading={loading}
+        />
+      )}
 
-      {loading && doc && <div className="loading-bar" />}
+      {loading && tabs.length > 0 && <div className="loading-bar" />}
 
       {dragging && (
         <div className="drop-overlay">
           <div className="drop-card">
             <Icon name="upload" size={30} />
-            <p>Drop a PDF or link to open</p>
+            <p>{tabs.length > 0 ? "Drop a PDF or link to open in a new tab" : "Drop a PDF or link to open"}</p>
           </div>
         </div>
       )}
@@ -1297,14 +1601,14 @@ export default function App() {
       {dialog === "settings" && <SettingsDialog theme={theme} onTheme={setThemeTo} night={night} onNight={setNightTo} onOpenChangelog={() => setDialog("changelog")} onClose={() => setDialog(null)} />}
       {/* Closing goes back to Settings, where the changelog is opened from. */}
       {dialog === "changelog" && <ChangelogDialog onClose={() => setDialog("settings")} />}
-      {doc && imageView && <ImageViewer pdf={doc.pdf} target={imageView} onClose={() => setImageView(null)} />}
+      {viewingDoc && imageView && <ImageViewer pdf={doc.pdf} target={imageView} onClose={() => setImageView(null)} />}
       {dialog === "url" && <OpenUrlDialog onClose={() => setDialog(null)} onSubmit={(url) => { setDialog(null); openUrl(url); }} />}
-      {doc && signing && <SignatureDialog key={doc.id + ":" + page} pdf={doc.pdf} pageNumber={page} targets={signatureTargets}
+      {viewingDoc && signing && <SignatureDialog key={doc.id + ":" + page} pdf={doc.pdf} pageNumber={page} targets={signatureTargets}
         onClose={() => setSigning(false)} onApprove={async (signature, rect) => {
           await placeSignature(viewerRef.current!, doc.pdf, page, signature, rect);
-          setDirty(true); setSignatureDismissed(true); flash(keys("Signature added. Ctrl+Z to undo; Save copy to export."));
+          markTabDirty(doc.id, true); setSignatureDismissed(true); flash(keys("Signature added. Ctrl+Z to undo; Save copy to export."));
         }} />}
-      {doc && !signing && signatureTargets.length > 0 && !signatureDismissed && <div className="signature-suggestion" role="status">
+      {viewingDoc && !signing && signatureTargets.length > 0 && !signatureDismissed && <div className="signature-suggestion" role="status">
         <span>{signatureTargets[0].kind === "field" ? "Signature field detected" : "Possible signature area"} on page {page}</span>
         <button className="btn primary" onClick={startSigning}>Review signature</button>
         <button className="pill-btn" aria-label="Dismiss signature suggestion" onClick={() => setSignatureDismissed(true)}><Icon name="close" size={14} /></button>
@@ -1319,7 +1623,7 @@ export default function App() {
           <button
             className="btn primary"
             onClick={() => {
-              if (dirty && !confirm("You have unsaved annotations. Restart anyway?")) return;
+              if (anyDirty && !confirm("You have unsaved annotations. Restart anyway?")) return;
               window.folioDesktop?.installUpdate();
             }}
           >

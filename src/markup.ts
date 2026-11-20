@@ -69,6 +69,8 @@ export class MarkupController {
   #restoring = new Set<number>();
   /** The most recent text selection in the document, used as the text of the next new highlight. */
   #lastSelection = { text: "", at: 0 };
+  /** In-memory cache for password-protected tabs so markup survives switching tabs without touching disk. */
+  #memory = new Map<string, DocNotes>();
   #syncTimer = 0;
   #saveTimer = 0;
   #listener: (state: MarkupState) => void;
@@ -112,7 +114,7 @@ export class MarkupController {
     this.#pending.clear();
     this.#known.clear();
     this.#note = "";
-    const saved = persist ? await getNotes(docId) : undefined;
+    const saved = persist ? await getNotes(docId) : this.#memory.get(docId);
     if (this.#docId !== docId) return;
     this.#note = saved?.note ?? "";
     for (const mark of saved?.marks ?? []) {
@@ -124,6 +126,11 @@ export class MarkupController {
     this.#emit();
     // Pages that rendered before the saved data arrived.
     for (const page of [...this.#pending.keys()]) if (this.#ui?.getLayer(page)) void this.#restorePage(page);
+  }
+
+  /** Drops the in-memory markup cache for a closed non-persisted tab. */
+  forget(docId: string) {
+    this.#memory.delete(docId);
   }
 
   unload() {
@@ -301,9 +308,15 @@ export class MarkupController {
 
   flush() {
     window.clearTimeout(this.#saveTimer);
-    if (!this.#persist || !this.#docId) return;
+    if (!this.#docId) return;
     const notes: DocNotes = { id: this.#docId, note: this.#note, marks: [...this.#known.values()], updatedAt: Date.now() };
-    void saveNotes(notes);
+    if (this.#persist) {
+      void saveNotes(notes);
+    } else if (!notes.note.trim() && notes.marks.length === 0) {
+      this.#memory.delete(this.#docId);
+    } else {
+      this.#memory.set(this.#docId, notes);
+    }
   }
 
   /**

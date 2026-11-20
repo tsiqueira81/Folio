@@ -235,6 +235,9 @@ export function WordCountDialog({
 const SHORTCUTS: [string, string][] = [
   ["Open file", "Ctrl O"],
   ["Open from URL", "Ctrl Shift O"],
+  ["New tab", "Ctrl T"],
+  ["Close tab", "Alt W"],
+  ["Next / previous tab", "Alt → / Alt ←"],
   ["Highlight selection", "H"],
   ["Write a note on the selection", "N"],
   ["Remove a clicked highlight", "Delete"],
